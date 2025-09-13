@@ -49,7 +49,7 @@ with DAG(
     default_args=default_args,
     schedule_interval=None,
     tags=['s3', 'audio', 'test'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # valid permissions only
     params={
         's3_endpoint': Param("minio-service.ezdata-system.svc.cluster.local:30000", type="string"),
         's3_endpoint_ssl_enabled': Param(False, type="boolean"),
@@ -79,6 +79,6 @@ with DAG(
         except botocore.exceptions.ClientError as e:
             raise RuntimeError(f"Error listing S3 objects: {str(e)}")
 
-    # Tasks execution
+    # Task execution
     list_raw_files = list_s3_objects(bucket_name_param='s3_bucket_raw', prefix_param='s3_files_prefix_raw')
     list_processed_files = list_s3_objects(bucket_name_param='s3_bucket_processed', prefix_param='s3_files_prefix_processed')
