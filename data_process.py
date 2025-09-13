@@ -1,12 +1,11 @@
 import base64
 import boto3
-import botocore.exceptions
+from io import BytesIO
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.utils.dates import days_ago
 from airflow.operators.python import get_current_context, PythonVirtualenvOperator
-from io import BytesIO
 
 # -----------------------------
 # Helper Functions
@@ -59,33 +58,29 @@ with DAG(
 
     @task
     def list_raw_wav_files():
-        """List all WAV files in the raw audio bucket."""
+        """Return list of WAV files in raw bucket"""
         context = get_current_context()
-        bucket_name = context['params']['s3_bucket_raw']
+        bucket = context['params']['s3_bucket_raw']
         prefix = context['params']['s3_files_prefix_raw']
         s3 = get_s3_client(context['params']['s3_endpoint'], context['params']['s3_endpoint_ssl_enabled'])
-        resp = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
         if "Contents" in resp:
             return [obj["Key"] for obj in resp["Contents"] if obj["Key"].lower().endswith(".wav")]
         return []
 
     def preprocess_audio_file(input_key: str):
-        """Runs inside PythonVirtualenvOperator, has all packages available."""
-        import librosa
-        import noisereduce as nr
-        import soundfile as sf
+        """Runs inside PythonVirtualenvOperator"""
+        import boto3, base64
+        import librosa, noisereduce as nr, soundfile as sf
         from io import BytesIO
-        import boto3
-        import base64
+        from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook
 
-        # Get token and S3 client
+        # Setup S3 client with token
         with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
             namespace = f.read()
-        from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook
         k8s_hook = KubernetesHook()
         secret = k8s_hook.core_v1_client.read_namespaced_secret("access-token", namespace)
-        token_encoded = secret.data["AUTH_TOKEN"]
-        jwt_token = base64.b64decode(token_encoded).decode("utf-8")
+        jwt_token = base64.b64decode(secret.data["AUTH_TOKEN"]).decode("utf-8")
 
         s3 = boto3.client(
             "s3",
@@ -98,7 +93,7 @@ with DAG(
         output_bucket = "audio-processed"
         output_key = input_key.replace(".wav", "_processed.wav")
 
-        # Skip if exists
+        # Skip if already processed
         try:
             s3.head_object(Bucket=output_bucket, Key=output_key)
             print(f"Skipping {input_key}, already processed.")
@@ -106,9 +101,7 @@ with DAG(
         except:
             pass
 
-        # Download
         audio_bytes = BytesIO(s3.get_object(Bucket=input_bucket, Key=input_key)['Body'].read())
-
         audio, sr = librosa.load(audio_bytes, sr=None)
         audio_denoised = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
         audio_norm = librosa.util.normalize(audio_denoised)
@@ -120,17 +113,14 @@ with DAG(
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=buf.getvalue())
         print(f"Processed and uploaded {output_key}")
 
-    # DAG flow
+    # DAG flow using dynamic mapping
     wav_files = list_raw_wav_files()
 
     from airflow.operators.python import PythonVirtualenvOperator
-    process_tasks = [
-        PythonVirtualenvOperator(
-            task_id=f"process_{key.replace('/', '_')}",
-            python_callable=preprocess_audio_file,
-            requirements=["librosa", "noisereduce", "soundfile", "numpy", "boto3"],
-            system_site_packages=False,
-            op_args=[key],
-        )
-        for key in wav_files
-    ]
+
+    process_wav_files = PythonVirtualenvOperator.partial(
+        task_id="process_wav_file",
+        python_callable=preprocess_audio_file,
+        requirements=["librosa", "noisereduce", "soundfile", "numpy", "boto3"],
+        system_site_packages=False,
+    ).expand(op_args=[wav_files])
