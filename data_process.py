@@ -49,13 +49,12 @@ with DAG(
     default_args=default_args,
     schedule_interval=None,
     tags=['audio', 'processing'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
     params={
         's3_endpoint': Param("local-s3-service.ezdata-system.svc.cluster.local:30000", type="string"),
         's3_endpoint_ssl_enabled': Param(False, type="boolean"),
         's3_bucket_raw': Param("audio-raw", type="string"),
         's3_bucket_processed': Param("audio-processed", type="string"),
-        's3_files_prefix_raw': Param("", type="string"),
     }
 ) as dag:
 
@@ -64,15 +63,18 @@ with DAG(
         """Return list of WAV files in raw bucket"""
         context = get_current_context()
         bucket = context['params']['s3_bucket_raw']
-        prefix = context['params']['s3_files_prefix_raw']
         s3 = get_s3_client(context['params']['s3_endpoint'], context['params']['s3_endpoint_ssl_enabled'])
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix="")  # hardcoded empty prefix
         if "Contents" in resp:
-            return [obj["Key"] for obj in resp["Contents"] if obj["Key"].lower().endswith(".wav")]
+            wav_files = [obj["Key"] for obj in resp["Contents"] if obj["Key"].lower().endswith(".wav")]
+            if not wav_files:
+                print("No new WAV files to process in raw bucket.")
+            return wav_files
+        print("No new WAV files to process in raw bucket.")
         return []
 
     def preprocess_audio_file(input_key: str):
-        """Process a single WAV file: denoise, normalize, preemphasis, upload to processed bucket"""
+        """Process a single WAV file and upload to processed bucket"""
         import boto3, base64
         import librosa, noisereduce as nr, soundfile as sf
         from io import BytesIO
@@ -104,6 +106,7 @@ with DAG(
         except:
             pass
 
+        # Process audio
         audio_bytes = BytesIO(s3.get_object(Bucket=input_bucket, Key=input_key)['Body'].read())
         audio, sr = librosa.load(audio_bytes, sr=None)
         audio_denoised = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
