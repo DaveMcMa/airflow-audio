@@ -101,20 +101,26 @@ with DAG(
         except:
             pass
 
+        # Download audio from S3
         audio_bytes = BytesIO(s3.get_object(Bucket=input_bucket, Key=input_key)['Body'].read())
         audio, sr = librosa.load(audio_bytes, sr=None)
+
+        # Noise reduction and normalization
         audio_denoised = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
         audio_norm = librosa.util.normalize(audio_denoised)
         audio_final = librosa.effects.preemphasis(audio_norm, coef=0.95)
 
+        # Write processed audio back to S3
         buf = BytesIO()
         sf.write(buf, audio_final, sr, format='WAV')
         buf.seek(0)
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=buf.getvalue())
         print(f"Processed and uploaded {output_key}")
 
-    # DAG flow using dynamic mapping
-    wav_files = list_raw_wav_files()
+    # -----------------------------
+    # DAG Flow
+    # -----------------------------
+    raw_files_task = list_raw_wav_files()
 
     from airflow.operators.python import PythonVirtualenvOperator
 
@@ -123,4 +129,7 @@ with DAG(
         python_callable=preprocess_audio_file,
         requirements=["librosa", "noisereduce", "soundfile", "numpy", "boto3"],
         system_site_packages=False,
-    ).expand(op_args=[wav_files])
+    ).expand(op_args=raw_files_task)
+
+    # Ensure listing happens before processing
+    raw_files_task >> process_wav_files
