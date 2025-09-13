@@ -41,6 +41,7 @@ with DAG(
     start_date=days_ago(1),
     tags=['audio', 'processing'],
     catchup=False,
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # <-- restored
 ) as dag:
 
     @task
