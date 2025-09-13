@@ -3,7 +3,6 @@ import boto3
 import botocore.exceptions
 from airflow import DAG
 from airflow.decorators import task
-from airflow.models.param import Param
 from airflow.utils.dates import days_ago
 from airflow.operators.python import get_current_context
 
@@ -51,34 +50,31 @@ with DAG(
     tags=['s3', 'audio', 'test'],
     access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
     params={
-        's3_endpoint': Param("local-s3-service.ezdata-system.svc.cluster.local:30000", type="string"),
-        's3_endpoint_ssl_enabled': Param(False, type="boolean"),
-        's3_bucket_raw': Param("audio-raw", type="string"),
-        's3_bucket_processed': Param("audio-processed", type="string"),
-        's3_files_prefix_raw': Param("", type="string"),
-        's3_files_prefix_processed': Param("", type="string"),
+        's3_endpoint': "local-s3-service.ezdata-system.svc.cluster.local:30000",
+        's3_endpoint_ssl_enabled': False,
+        's3_bucket_raw': "audio-raw",
+        's3_bucket_processed': "audio-processed",
     }
 ) as dag:
 
     @task
-    def list_s3_objects(bucket_param: str, prefix_param: str):
+    def list_s3_objects(bucket_name: str):
+        """List all objects in the given bucket (no prefix)."""
         context = get_current_context()
-        bucket_name = context['params'][bucket_param]
-        prefix = context['params'][prefix_param]
         s3 = get_s3_client(context['params']['s3_endpoint'], context['params']['s3_endpoint_ssl_enabled'])
         try:
-            resp = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+            resp = s3.list_objects_v2(Bucket=bucket_name, Prefix="")  # always empty string
             if "Contents" in resp:
                 keys = [obj["Key"] for obj in resp["Contents"]]
-                print(f"Objects in bucket '{bucket_name}' with prefix '{prefix}':")
+                print(f"Objects in bucket '{bucket_name}':")
                 for k in keys:
                     print(f" - {k}")
                 return keys
-            print(f"No objects found in bucket '{bucket_name}' with prefix '{prefix}'.")
+            print(f"No objects found in bucket '{bucket_name}'.")
             return []
         except botocore.exceptions.ClientError as e:
             raise RuntimeError(f"Error listing S3 objects: {str(e)}")
 
     # Tasks
-    list_raw_files = list_s3_objects("s3_bucket_raw", "s3_files_prefix_raw")
-    list_processed_files = list_s3_objects("s3_bucket_processed", "s3_files_prefix_processed")
+    list_raw_files = list_s3_objects("audio-raw")
+    list_processed_files = list_s3_objects("audio-processed")
