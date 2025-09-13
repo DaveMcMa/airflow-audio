@@ -45,23 +45,23 @@ default_args = {
 }
 
 with DAG(
-    dag_id='test_audio_dag',  # Display name of DAG
+    dag_id='test_audio_dag',
     default_args=default_args,
     schedule_interval=None,
     tags=['s3', 'audio', 'test'],
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
     params={
         's3_endpoint': Param("minio-service.ezdata-system.svc.cluster.local:30000", type="string"),
         's3_endpoint_ssl_enabled': Param(False, type="boolean"),
         's3_bucket_raw': Param("audio-raw", type="string"),
         's3_bucket_processed': Param("audio-processed", type="string"),
-        's3_files_prefix_raw': Param("", type="string"),       # list all objects if empty
-        's3_files_prefix_processed': Param("", type="string"), # list all objects if empty
+        's3_files_prefix_raw': Param("", type="string"),
+        's3_files_prefix_processed': Param("", type="string"),
     }
 ) as dag:
 
     @task
     def list_s3_objects(bucket_name_param: str, prefix_param: str):
-        """List objects in the given S3 bucket/prefix."""
         context = get_current_context()
         bucket_name = context['params'][bucket_name_param]
         prefix = context['params'][prefix_param]
