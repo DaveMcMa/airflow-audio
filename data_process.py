@@ -4,8 +4,8 @@ from io import BytesIO
 from airflow import DAG
 from airflow.decorators import task
 from airflow.utils.dates import days_ago
-from airflow.operators.python import get_current_context
 import subprocess
+import importlib
 
 # -----------------------------
 # Helper Functions
@@ -33,6 +33,7 @@ def get_s3_client():
         use_ssl=False,
     )
 
+
 # -----------------------------
 # DAG Definition
 # -----------------------------
@@ -52,27 +53,32 @@ with DAG(
 ) as dag:
 
     @task
+    def init_pod():
+        """Install required packages once per pod"""
+        print("Installing required packages...")
+        subprocess.run(
+            ["pip", "install", "librosa", "noisereduce", "soundfile", "numpy"],
+            check=True
+        )
+        # Verify installation
+        for pkg in ["librosa", "noisereduce", "soundfile", "numpy"]:
+            module = importlib.import_module(pkg)
+            print(f"{pkg} version: {module.__version__}")
+
+    @task
     def list_raw_files():
         """List all WAV files in the raw bucket"""
         s3 = get_s3_client()
         bucket = "audio-raw"
         resp = s3.list_objects_v2(Bucket=bucket)
         files = [obj["Key"] for obj in resp.get("Contents", []) if obj["Key"].lower().endswith(".wav")]
-        if not files:
-            print("No new WAV files found to process.")
-        else:
-            print(f"Found {len(files)} WAV files: {files}")
+        print(f"Found {len(files)} WAV files: {files}")
         return files
 
     @task
     def process_file(file_key: str):
-        """Process a single WAV file, installing packages if needed"""
-        # Install packages at runtime
-        subprocess.run(
-            ["pip", "install", "--quiet", "librosa", "noisereduce", "soundfile", "numpy"],
-            check=True
-        )
-
+        """Process a single WAV file"""
+        # Import packages (already installed by init_pod)
         import librosa
         import noisereduce as nr
         import soundfile as sf
@@ -107,5 +113,6 @@ with DAG(
     # -----------------------------
     # DAG Flow
     # -----------------------------
+    init = init_pod()
     raw_files = list_raw_files()
-    process_file.expand(file_key=raw_files)
+    process_file.expand(file_key=raw_files) << init
