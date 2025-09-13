@@ -51,7 +51,7 @@ with DAG(
     tags=['s3', 'audio', 'test'],
     access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
     params={
-        's3_endpoint': Param("http://local-s3-service.ezdata-system.svc.cluster.local:30000", type="string"),
+        's3_endpoint': Param("local-s3-service.ezdata-system.svc.cluster.local:30000", type="string"),
         's3_endpoint_ssl_enabled': Param(False, type="boolean"),
         's3_bucket_raw': Param("audio-raw", type="string"),
         's3_bucket_processed': Param("audio-processed", type="string"),
