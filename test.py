@@ -45,23 +45,26 @@ default_args = {
 }
 
 with DAG(
-    dag_id='s3_list_objects_skeleton',
+    dag_id='test_audio_dag',  # Display name of DAG
     default_args=default_args,
     schedule_interval=None,
-    tags=['s3', 'test'],
+    tags=['s3', 'audio', 'test'],
     params={
         's3_endpoint': Param("minio-service.ezdata-system.svc.cluster.local:30000", type="string"),
         's3_endpoint_ssl_enabled': Param(False, type="boolean"),
-        's3_bucket_name': Param("bank", type="string"),
-        's3_files_prefix': Param("", type="string"),  # list all objects if empty
+        's3_bucket_raw': Param("audio-raw", type="string"),
+        's3_bucket_processed': Param("audio-processed", type="string"),
+        's3_files_prefix_raw': Param("", type="string"),       # list all objects if empty
+        's3_files_prefix_processed': Param("", type="string"), # list all objects if empty
     }
 ) as dag:
 
     @task
-    def list_s3_objects():
+    def list_s3_objects(bucket_name_param: str, prefix_param: str):
+        """List objects in the given S3 bucket/prefix."""
         context = get_current_context()
-        bucket_name = context['params']['s3_bucket_name']
-        prefix = context['params']['s3_files_prefix']
+        bucket_name = context['params'][bucket_name_param]
+        prefix = context['params'][prefix_param]
         s3 = get_s3_client(context['params']['s3_endpoint'], context['params']['s3_endpoint_ssl_enabled'])
         try:
             resp = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
@@ -76,5 +79,6 @@ with DAG(
         except botocore.exceptions.ClientError as e:
             raise RuntimeError(f"Error listing S3 objects: {str(e)}")
 
-    # Task execution
-    list_s3_objects()
+    # Tasks execution
+    list_raw_files = list_s3_objects(bucket_name_param='s3_bucket_raw', prefix_param='s3_files_prefix_raw')
+    list_processed_files = list_s3_objects(bucket_name_param='s3_bucket_processed', prefix_param='s3_files_prefix_processed')
