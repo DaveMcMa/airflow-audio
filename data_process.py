@@ -4,7 +4,6 @@ from io import BytesIO
 from airflow import DAG
 from airflow.decorators import task
 from airflow.utils.dates import days_ago
-from airflow.operators.python import get_current_context
 import subprocess
 
 # -----------------------------
@@ -36,19 +35,12 @@ def get_s3_client():
 # -----------------------------
 # DAG Definition
 # -----------------------------
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'start_date': days_ago(1),
-    'retries': 0,
-}
-
 with DAG(
     dag_id='process_audio_all_files',
-    default_args=default_args,
-    schedule_interval=None,
+    schedule_interval='0 */12 * * *',  # every 12 hours
+    start_date=days_ago(1),
     tags=['audio', 'processing'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
+    catchup=False,
 ) as dag:
 
     @task
@@ -64,15 +56,11 @@ with DAG(
     @task
     def process_file(file_key: str):
         """Process a single WAV file, installing packages if needed"""
-        # Install packages at runtime with full pip logging
-        result = subprocess.run(
-            ["pip", "install", "librosa", "noisereduce", "soundfile", "numpy"],
-            capture_output=True,
-            text=True,
+        # Install packages at runtime
+        subprocess.run(
+            ["pip", "install", "--quiet", "librosa", "noisereduce", "soundfile", "numpy"],
             check=True
         )
-        print(result.stdout)
-        print(result.stderr)
 
         import librosa
         import noisereduce as nr
