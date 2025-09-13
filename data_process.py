@@ -1,36 +1,14 @@
-# -----------------------------
-# INSTALL MISSING PACKAGES AT RUNTIME
-# -----------------------------
-import subprocess
-import sys
-
-required_packages = ["boto3", "librosa", "noisereduce", "soundfile", "numpy"]
-for package in required_packages:
-    try:
-        __import__(package)
-    except ImportError:
-        print(f"Installing missing package: {package}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# -----------------------------
-# REGULAR IMPORTS AFTER INSTALLATION
-# -----------------------------
 import base64
 import boto3
 from io import BytesIO
+import subprocess
 from airflow import DAG
 from airflow.decorators import task
-from airflow.models.param import Param
 from airflow.utils.dates import days_ago
 from airflow.operators.python import get_current_context
 
-import librosa
-import noisereduce as nr
-import soundfile as sf
-import numpy as np
-
 # -----------------------------
-# HELPER FUNCTIONS
+# Helper Functions
 # -----------------------------
 def get_token():
     """Fetch JWT token from Kubernetes secret."""
@@ -41,7 +19,6 @@ def get_token():
     secret = k8s_hook.core_v1_client.read_namespaced_secret("access-token", namespace)
     token_encoded = secret.data["AUTH_TOKEN"]  # type: ignore
     return base64.b64decode(token_encoded).decode("utf-8")
-
 
 def get_s3_client(endpoint_host: str, ssl_enabled: bool):
     """Return boto3 S3 client configured with JWT auth."""
@@ -56,9 +33,8 @@ def get_s3_client(endpoint_host: str, ssl_enabled: bool):
     )
     return s3
 
-
 # -----------------------------
-# DAG DEFINITION
+# DAG Definition
 # -----------------------------
 default_args = {
     'owner': 'airflow',
@@ -68,50 +44,50 @@ default_args = {
 }
 
 with DAG(
-    dag_id='process_audio',
+    dag_id='process_single_audio_file',
     default_args=default_args,
     schedule_interval=None,
     tags=['audio', 'processing'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid
-    params={
-        's3_endpoint': Param("local-s3-service.ezdata-system.svc.cluster.local:30000", type="string"),
-        's3_endpoint_ssl_enabled': Param(False, type="boolean"),
-        's3_bucket_raw': Param("audio-raw", type="string"),
-        's3_bucket_processed': Param("audio-processed", type="string"),
-    }
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
 ) as dag:
 
     @task
-    def list_raw_wav_files():
-        """Return list of WAV files in raw bucket"""
-        context = get_current_context()
-        bucket = context['params']['s3_bucket_raw']
-        s3 = get_s3_client(context['params']['s3_endpoint'], context['params']['s3_endpoint_ssl_enabled'])
-        resp = s3.list_objects_v2(Bucket=bucket)
-        if "Contents" in resp:
-            return [obj["Key"] for obj in resp["Contents"] if obj["Key"].lower().endswith(".wav")]
-        print("No WAV files found in raw bucket.")
-        return []
+    def process_audio_file(file_key: str):
+        """Process a single audio file from S3."""
+        # Install missing packages at runtime
+        for pkg in ["librosa", "noisereduce", "soundfile", "numpy"]:
+            try:
+                __import__(pkg)
+            except ImportError:
+                print(f"Installing missing package: {pkg}")
+                subprocess.check_call(["python3", "-m", "pip", "install", pkg])
 
-    @task
-    def preprocess_audio_file(input_key: str):
-        """Preprocess a single WAV file: denoise, normalize, preemphasis, upload to processed bucket"""
+        import librosa
+        import noisereduce as nr
+        import soundfile as sf
+
         context = get_current_context()
-        input_bucket = context['params']['s3_bucket_raw']
-        output_bucket = context['params']['s3_bucket_processed']
-        s3 = get_s3_client(context['params']['s3_endpoint'], context['params']['s3_endpoint_ssl_enabled'])
-        output_key = input_key.replace(".wav", "_processed.wav")
+        s3_endpoint = "local-s3-service.ezdata-system.svc.cluster.local:30000"
+        s3_ssl = False
+        input_bucket = "audio-raw"
+        output_bucket = "audio-processed"
+
+        s3 = get_s3_client(s3_endpoint, s3_ssl)
+        output_key = file_key.replace(".wav", "_processed.wav")
 
         # Skip if already processed
         try:
             s3.head_object(Bucket=output_bucket, Key=output_key)
-            print(f"Skipping {input_key}, already processed.")
+            print(f"Skipping {file_key}, already processed.")
             return
         except:
             pass
 
-        audio_bytes = BytesIO(s3.get_object(Bucket=input_bucket, Key=input_key)['Body'].read())
+        print(f"Downloading {file_key} from {input_bucket}")
+        audio_bytes = BytesIO(s3.get_object(Bucket=input_bucket, Key=file_key)['Body'].read())
         audio, sr = librosa.load(audio_bytes, sr=None)
+
+        print(f"Processing {file_key}")
         audio_denoised = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
         audio_norm = librosa.util.normalize(audio_denoised)
         audio_final = librosa.effects.preemphasis(audio_norm, coef=0.95)
@@ -119,11 +95,9 @@ with DAG(
         buf = BytesIO()
         sf.write(buf, audio_final, sr, format='WAV')
         buf.seek(0)
+        print(f"Uploading processed file to {output_bucket}/{output_key}")
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=buf.getvalue())
-        print(f"Processed and uploaded {output_key}")
+        print(f"Finished processing {file_key}")
 
-    # -----------------------------
-    # DAG FLOW
-    # -----------------------------
-    raw_files_task = list_raw_wav_files()
-    processed = preprocess_audio_file.expand(input_key=raw_files_task)
+    # Example: replace "test1.wav" with the actual key you want to process
+    process_audio_file("test1.wav")
