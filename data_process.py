@@ -72,7 +72,7 @@ with DAG(
     default_args=default_args,
     schedule_interval=None,
     tags=['audio', 'processing'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid
     params={
         's3_endpoint': Param("local-s3-service.ezdata-system.svc.cluster.local:30000", type="string"),
         's3_endpoint_ssl_enabled': Param(False, type="boolean"),
