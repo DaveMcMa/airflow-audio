@@ -58,7 +58,10 @@ with DAG(
         bucket = "audio-raw"
         resp = s3.list_objects_v2(Bucket=bucket)
         files = [obj["Key"] for obj in resp.get("Contents", []) if obj["Key"].lower().endswith(".wav")]
-        print(f"Found {len(files)} WAV files: {files}")
+        if not files:
+            print("No new WAV files found to process.")
+        else:
+            print(f"Found {len(files)} WAV files: {files}")
         return files
 
     @task
