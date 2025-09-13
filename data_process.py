@@ -1,11 +1,11 @@
 import base64
 import boto3
 from io import BytesIO
-import subprocess
 from airflow import DAG
 from airflow.decorators import task
 from airflow.utils.dates import days_ago
 from airflow.operators.python import get_current_context
+import subprocess
 
 # -----------------------------
 # Helper Functions
@@ -20,18 +20,18 @@ def get_token():
     token_encoded = secret.data["AUTH_TOKEN"]  # type: ignore
     return base64.b64decode(token_encoded).decode("utf-8")
 
-def get_s3_client(endpoint_host: str, ssl_enabled: bool):
+
+def get_s3_client():
     """Return boto3 S3 client configured with JWT auth."""
-    endpoint_url = f"http{'s' if ssl_enabled else ''}://{endpoint_host}"
+    endpoint_url = "http://local-s3-service.ezdata-system.svc.cluster.local:30000"
     jwt_token = get_token()
-    s3 = boto3.client(
+    return boto3.client(
         "s3",
         aws_access_key_id=jwt_token,
         aws_secret_access_key="s3",
         endpoint_url=endpoint_url,
-        use_ssl=ssl_enabled,
+        use_ssl=False,
     )
-    return s3
 
 # -----------------------------
 # DAG Definition
@@ -44,35 +44,39 @@ default_args = {
 }
 
 with DAG(
-    dag_id='process_single_audio_file',
+    dag_id='process_audio_all_files',
     default_args=default_args,
     schedule_interval=None,
     tags=['audio', 'processing'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
 ) as dag:
 
     @task
-    def process_audio_file(file_key: str):
-        """Process a single audio file from S3."""
-        # Install missing packages at runtime
-        for pkg in ["librosa", "noisereduce", "soundfile", "numpy"]:
-            try:
-                __import__(pkg)
-            except ImportError:
-                print(f"Installing missing package: {pkg}")
-                subprocess.check_call(["python3", "-m", "pip", "install", pkg])
+    def list_raw_files():
+        """List all WAV files in the raw bucket"""
+        s3 = get_s3_client()
+        bucket = "audio-raw"
+        resp = s3.list_objects_v2(Bucket=bucket)
+        files = [obj["Key"] for obj in resp.get("Contents", []) if obj["Key"].lower().endswith(".wav")]
+        print(f"Found {len(files)} WAV files: {files}")
+        return files
+
+    @task
+    def process_file(file_key: str):
+        """Process a single WAV file, installing packages if needed"""
+        # Install packages at runtime
+        subprocess.run(
+            ["pip", "install", "--quiet", "librosa", "noisereduce", "soundfile", "numpy"],
+            check=True
+        )
 
         import librosa
         import noisereduce as nr
         import soundfile as sf
 
-        context = get_current_context()
-        s3_endpoint = "local-s3-service.ezdata-system.svc.cluster.local:30000"
-        s3_ssl = False
+        s3 = get_s3_client()
         input_bucket = "audio-raw"
         output_bucket = "audio-processed"
-
-        s3 = get_s3_client(s3_endpoint, s3_ssl)
         output_key = file_key.replace(".wav", "_processed.wav")
 
         # Skip if already processed
@@ -80,24 +84,25 @@ with DAG(
             s3.head_object(Bucket=output_bucket, Key=output_key)
             print(f"Skipping {file_key}, already processed.")
             return
-        except:
+        except s3.exceptions.ClientError:
             pass
 
-        print(f"Downloading {file_key} from {input_bucket}")
+        # Download
         audio_bytes = BytesIO(s3.get_object(Bucket=input_bucket, Key=file_key)['Body'].read())
         audio, sr = librosa.load(audio_bytes, sr=None)
-
-        print(f"Processing {file_key}")
+        # Process
         audio_denoised = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
         audio_norm = librosa.util.normalize(audio_denoised)
         audio_final = librosa.effects.preemphasis(audio_norm, coef=0.95)
-
+        # Upload
         buf = BytesIO()
         sf.write(buf, audio_final, sr, format='WAV')
         buf.seek(0)
-        print(f"Uploading processed file to {output_bucket}/{output_key}")
         s3.put_object(Bucket=output_bucket, Key=output_key, Body=buf.getvalue())
-        print(f"Finished processing {file_key}")
+        print(f"Processed and uploaded: {output_key}")
 
-    # Example: replace "test1.wav" with the actual key you want to process
-    process_audio_file("test1.wav")
+    # -----------------------------
+    # DAG Flow
+    # -----------------------------
+    raw_files = list_raw_files()
+    process_file.expand(file_key=raw_files)
