@@ -64,11 +64,15 @@ with DAG(
     @task
     def process_file(file_key: str):
         """Process a single WAV file, installing packages if needed"""
-        # Install packages at runtime
-        subprocess.run(
-            ["pip", "install", "--quiet", "librosa", "noisereduce", "soundfile", "numpy"],
+        # Install packages at runtime with full pip logging
+        result = subprocess.run(
+            ["pip", "install", "librosa", "noisereduce", "soundfile", "numpy"],
+            capture_output=True,
+            text=True,
             check=True
         )
+        print(result.stdout)
+        print(result.stderr)
 
         import librosa
         import noisereduce as nr
