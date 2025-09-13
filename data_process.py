@@ -11,6 +11,7 @@ from airflow.operators.python import get_current_context, PythonVirtualenvOperat
 # Helper Functions
 # -----------------------------
 def get_token():
+    """Fetch JWT token from Kubernetes secret."""
     with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
         namespace = f.read()
     from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook
@@ -19,7 +20,9 @@ def get_token():
     token_encoded = secret.data["AUTH_TOKEN"]  # type: ignore
     return base64.b64decode(token_encoded).decode("utf-8")
 
+
 def get_s3_client(endpoint_host: str, ssl_enabled: bool):
+    """Return boto3 S3 client configured with JWT auth."""
     endpoint_url = f"http{'s' if ssl_enabled else ''}://{endpoint_host}"
     jwt_token = get_token()
     s3 = boto3.client(
@@ -46,7 +49,7 @@ with DAG(
     default_args=default_args,
     schedule_interval=None,
     tags=['audio', 'processing'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
+    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
     params={
         's3_endpoint': Param("minio-service.ezdata-system.svc.cluster.local:30000", type="string"),
         's3_endpoint_ssl_enabled': Param(False, type="boolean"),
@@ -69,13 +72,13 @@ with DAG(
         return []
 
     def preprocess_audio_file(input_key: str):
-        """Runs inside PythonVirtualenvOperator"""
+        """Process a single WAV file: denoise, normalize, preemphasis, upload to processed bucket"""
         import boto3, base64
         import librosa, noisereduce as nr, soundfile as sf
         from io import BytesIO
         from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook
 
-        # Setup S3 client with token
+        # S3 client
         with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
             namespace = f.read()
         k8s_hook = KubernetesHook()
@@ -101,16 +104,12 @@ with DAG(
         except:
             pass
 
-        # Download audio from S3
         audio_bytes = BytesIO(s3.get_object(Bucket=input_bucket, Key=input_key)['Body'].read())
         audio, sr = librosa.load(audio_bytes, sr=None)
-
-        # Noise reduction and normalization
         audio_denoised = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
         audio_norm = librosa.util.normalize(audio_denoised)
         audio_final = librosa.effects.preemphasis(audio_norm, coef=0.95)
 
-        # Write processed audio back to S3
         buf = BytesIO()
         sf.write(buf, audio_final, sr, format='WAV')
         buf.seek(0)
@@ -131,5 +130,4 @@ with DAG(
         system_site_packages=False,
     ).expand(op_args=raw_files_task)
 
-    # Ensure listing happens before processing
     raw_files_task >> process_wav_files
