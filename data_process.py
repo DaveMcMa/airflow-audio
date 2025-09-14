@@ -132,10 +132,13 @@ with DAG(
             # Install packages with error handling
             logger.info("Installing required packages...")
             result = subprocess.run(
-                ["pip", "install", "--quiet", "librosa==0.10.1", "noisereduce==3.0.0", "soundfile==0.12.1", "numpy==1.24.3"],
+                ["pip", "install", "--quiet", "--no-cache-dir",
+                 "torch==2.0.1", "torchaudio==2.0.2", 
+                 "librosa==0.10.1", "noisereduce==3.0.0", 
+                 "soundfile==0.12.1", "numpy==1.24.3"],
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 minute timeout
+                timeout=600  # 10 minute timeout for PyTorch installation
             )
             
             if result.returncode != 0:
