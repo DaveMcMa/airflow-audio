@@ -48,7 +48,7 @@ def get_s3_client():
 def install_audio_packages():
     """Install required audio processing packages"""
     packages = [
-        "https://files.pythonhosted.org/packages/py3/p/py_webrtcvad_wheels/py_webrtcvad_wheels-2.0.10-py3-none-any.whl",
+        "https://files.pythonhosted.org/packages/e4/14/2dc6e4e299ba4f29a9be07fed5da8e3d04ae8d06c44f4f21b16f2ccb9ae6/webrtcvad_wheels-2.0.14-cp39-cp39-linux_x86_64.whl",
         "torch==2.0.1", 
         "torchaudio==2.0.2", 
         "librosa==0.10.1", 
