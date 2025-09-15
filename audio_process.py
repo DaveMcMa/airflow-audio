@@ -44,11 +44,30 @@ def get_s3_client():
     except Exception as e:
         logger.error(f"Failed to create S3 client: {str(e)}")
         raise
-
 def install_audio_packages():
     """Install required audio processing packages"""
+    
+    logger.info("Installing required audio packages...")
+    
+    # Install webrtcvad-wheels first with specific flags
+    webrtc_result = subprocess.run(
+        [
+            "pip", "install", "--no-cache-dir", 
+            "--only-binary=:all:",  # Force binary wheel
+            "--prefer-binary",      # Prefer binary over source
+            "webrtcvad-wheels==2.0.14"
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300
+    )
+    
+    if webrtc_result.returncode != 0:
+        logger.error(f"WebRTC installation failed: {webrtc_result.stderr}")
+        raise RuntimeError(f"WebRTC installation failed: {webrtc_result.stderr}")
+    
+    # Install other packages
     packages = [
-        "https://files.pythonhosted.org/packages/22/0b/c7b85c5a7b2b1f5e1b93b3a2b9c4a5b2b7a8c9d0e1f2g3h4i5j6k7l8m9n/webrtcvad_wheels-2.0.14-cp311-cp311-linux_x86_64.whl",
         "torch==2.0.1", 
         "torchaudio==2.0.2", 
         "librosa==0.10.1", 
@@ -58,7 +77,6 @@ def install_audio_packages():
         "scipy==1.10.1"
     ]
     
-    logger.info("Installing required audio packages...")
     result = subprocess.run(
         ["pip", "install", "--no-cache-dir"] + packages,
         capture_output=True,
@@ -71,7 +89,6 @@ def install_audio_packages():
         raise RuntimeError(f"Package installation failed: {result.stderr}")
     
     logger.info("Audio packages installed successfully")
-
 def validate_audio_file(audio_data, sample_rate, min_duration=1.0, max_duration=3600.0):
     """Validate audio file properties"""
     duration = len(audio_data) / sample_rate
