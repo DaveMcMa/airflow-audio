@@ -54,8 +54,8 @@ def install_audio_packages():
         "noisereduce==3.0.0", 
         "soundfile==0.12.1", 
         "numpy==1.24.3",
-        "scipy==1.10.1",
-        "webrtcvad==2.0.10"  # Added for enhanced VAD
+        "scipy==1.10.1"
+        # Removed webrtcvad due to compilation issues in Airflow pods
     ]
     
     logger.info("Installing required audio packages...")
@@ -95,46 +95,73 @@ def validate_audio_file(audio_data, sample_rate, min_duration=1.0, max_duration=
 # Enhanced Audio Processing Functions
 # -----------------------------
 def enhanced_voice_activity_detection(audio, sr, frame_duration=20):
-    """Enhanced VAD with multiple aggressiveness levels and smoothing"""
-    import webrtcvad
+    """
+    Pure Python VAD using librosa features - no compilation needed
+    Combines multiple acoustic features for robust voice detection
+    """
+    import librosa
     import numpy as np
+    from scipy.signal import medfilt
     from scipy.ndimage import binary_dilation, binary_erosion
     
-    vad_levels = [1, 2, 3]
-    audio_16bit = (audio * 32767).astype(np.int16)
-    frame_size = int(sr * frame_duration / 1000)
+    # Frame parameters
+    frame_length = int(sr * frame_duration / 1000)  # 20ms frames
+    hop_length = frame_length // 2
     
-    # Pad audio
-    padding = frame_size - (len(audio_16bit) % frame_size)
-    if padding != frame_size:
-        audio_16bit = np.pad(audio_16bit, (0, padding), mode='constant')
+    # Compute multiple features for VAD
+    # 1. RMS Energy
+    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
     
-    # Collect votes from different VAD levels
-    vad_votes = []
-    for level in vad_levels:
-        vad = webrtcvad.Vad(level)
-        voice_frames = []
-        
-        for i in range(0, len(audio_16bit), frame_size):
-            frame = audio_16bit[i:i+frame_size].tobytes()
-            try:
-                is_speech = vad.is_speech(frame, sr)
-            except:
-                is_speech = False
-            voice_frames.append(is_speech)
-        
-        vad_votes.append(voice_frames)
+    # 2. Zero Crossing Rate (speech has moderate ZCR)
+    zcr = librosa.feature.zero_crossing_rate(audio, frame_length=frame_length, hop_length=hop_length)[0]
     
-    # Majority voting
-    final_voice_frames = []
-    for i in range(len(vad_votes[0])):
-        votes = sum(vad_vote[i] for vad_vote in vad_votes)
-        final_voice_frames.append(votes >= 2)  # At least 2 out of 3 agree
+    # 3. Spectral Centroid (speech has characteristic spectral shape)
+    spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=hop_length)[0]
     
-    # Convert to sample-level mask
-    voice_mask = np.repeat(final_voice_frames, frame_size)[:len(audio)]
+    # 4. Spectral Rolloff (useful for distinguishing speech from noise)
+    spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr, hop_length=hop_length)[0]
     
-    # Morphological operations to clean up mask
+    # 5. MFCCs (first few coefficients are good for speech detection)
+    mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=3, hop_length=hop_length)
+    mfcc_mean = np.mean(mfccs, axis=0)
+    
+    # Normalize all features
+    def normalize_feature(feature):
+        return (feature - np.mean(feature)) / (np.std(feature) + 1e-8)
+    
+    rms_norm = normalize_feature(rms)
+    zcr_norm = normalize_feature(zcr)
+    centroid_norm = normalize_feature(spectral_centroid)
+    rolloff_norm = normalize_feature(spectral_rolloff)
+    mfcc_norm = normalize_feature(mfcc_mean)
+    
+    # Multi-level thresholding approach
+    # Level 1: Energy-based detection (conservative)
+    energy_threshold = np.percentile(rms, 25)  # Bottom 25% is likely silence
+    energy_voice = rms > energy_threshold
+    
+    # Level 2: Spectral characteristics (moderate)
+    zcr_min, zcr_max = np.percentile(zcr, [15, 85])  # Speech has moderate ZCR
+    centroid_threshold = np.percentile(spectral_centroid, 30)  # Speech has higher centroid than noise
+    
+    spectral_voice = (zcr >= zcr_min) & (zcr <= zcr_max) & (spectral_centroid > centroid_threshold)
+    
+    # Level 3: Advanced features (aggressive)
+    # Combine MFCC and rolloff information
+    rolloff_threshold = np.percentile(spectral_rolloff, 35)
+    advanced_voice = (spectral_rolloff > rolloff_threshold) & (mfcc_mean > np.percentile(mfcc_mean, 25))
+    
+    # Voting mechanism: at least 2 out of 3 levels must agree
+    vote_count = energy_voice.astype(int) + spectral_voice.astype(int) + advanced_voice.astype(int)
+    final_voice_frames = vote_count >= 2
+    
+    # Apply median filtering to smooth the results
+    final_voice_frames = medfilt(final_voice_frames.astype(int), kernel_size=3).astype(bool)
+    
+    # Convert frame-level decisions to sample-level mask
+    voice_mask = np.repeat(final_voice_frames, hop_length)[:len(audio)]
+    
+    # Apply morphological operations for final cleanup
     voice_mask = binary_dilation(voice_mask, iterations=2)
     voice_mask = binary_erosion(voice_mask, iterations=1)
     
