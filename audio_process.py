@@ -8,15 +8,10 @@ from airflow.decorators import task
 from airflow.utils.dates import days_ago
 import subprocess
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
 def get_token():
-    """Fetch JWT token from Kubernetes secret."""
     try:
         with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
             namespace = f.read()
@@ -30,7 +25,6 @@ def get_token():
         raise
 
 def get_s3_client():
-    """Return boto3 S3 client configured with JWT auth."""
     endpoint_url = "http://local-s3-service.ezdata-system.svc.cluster.local:30000"
     try:
         jwt_token = get_token()
@@ -46,24 +40,18 @@ def get_s3_client():
         raise
 
 def install_audio_packages():
-    """Install required audio processing packages"""
     packages = [
+        "https://files.pythonhosted.org/packages/py3/p/py_webrtcvad_wheels/py_webrtcvad_wheels-2.0.10-py3-none-any.whl",
         "torch==2.0.1", 
-        "torchaudio==2.0.2", 
         "librosa==0.10.1", 
-        "noisereduce==3.0.0", 
         "soundfile==0.12.1", 
         "numpy==1.24.3",
         "scipy==1.10.1"
-        # Removed webrtcvad due to compilation issues in Airflow pods
     ]
     
-    logger.info("Installing required audio packages...")
     result = subprocess.run(
-        ["pip", "install", "--quiet", "--no-cache-dir"] + packages,
-        capture_output=True,
-        text=True,
-        timeout=900
+        ["pip", "install", "--user", "--no-cache-dir"] + packages,
+        capture_output=True, text=True, timeout=900
     )
     
     if result.returncode != 0:
@@ -72,150 +60,94 @@ def install_audio_packages():
     
     logger.info("Audio packages installed successfully")
 
-def validate_audio_file(audio_data, sample_rate, min_duration=1.0, max_duration=3600.0):
-    """Validate audio file properties"""
-    duration = len(audio_data) / sample_rate
-    
-    if duration < min_duration:
-        raise ValueError(f"Audio too short: {duration:.2f}s (minimum: {min_duration}s)")
-    
-    if duration > max_duration:
-        raise ValueError(f"Audio too long: {duration:.2f}s (maximum: {max_duration}s)")
-    
-    if sample_rate < 8000:
-        raise ValueError(f"Sample rate too low: {sample_rate}Hz (minimum: 8000Hz)")
-    
-    if len(audio_data.shape) > 1 and audio_data.shape[1] > 2:
-        raise ValueError(f"Too many channels: {audio_data.shape[1]} (maximum: 2)")
-    
-    logger.info(f"Audio validation passed: {duration:.2f}s at {sample_rate}Hz")
-    return True
-
-# -----------------------------
-# Enhanced Audio Processing Functions
-# -----------------------------
 def enhanced_voice_activity_detection(audio, sr, frame_duration=20):
-    """
-    Pure Python VAD using librosa features - no compilation needed
-    Combines multiple acoustic features for robust voice detection
-    """
-    import librosa
+    """Enhanced VAD using webrtcvad with fallback"""
     import numpy as np
-    from scipy.signal import medfilt
     from scipy.ndimage import binary_dilation, binary_erosion
     
-    # Frame parameters
-    frame_length = int(sr * frame_duration / 1000)  # 20ms frames
-    hop_length = frame_length // 2
-    
-    # Compute multiple features for VAD
-    # 1. RMS Energy
-    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
-    
-    # 2. Zero Crossing Rate (speech has moderate ZCR)
-    zcr = librosa.feature.zero_crossing_rate(audio, frame_length=frame_length, hop_length=hop_length)[0]
-    
-    # 3. Spectral Centroid (speech has characteristic spectral shape)
-    spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=hop_length)[0]
-    
-    # 4. Spectral Rolloff (useful for distinguishing speech from noise)
-    spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr, hop_length=hop_length)[0]
-    
-    # 5. MFCCs (first few coefficients are good for speech detection)
-    mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=3, hop_length=hop_length)
-    mfcc_mean = np.mean(mfccs, axis=0)
-    
-    # Normalize all features
-    def normalize_feature(feature):
-        return (feature - np.mean(feature)) / (np.std(feature) + 1e-8)
-    
-    rms_norm = normalize_feature(rms)
-    zcr_norm = normalize_feature(zcr)
-    centroid_norm = normalize_feature(spectral_centroid)
-    rolloff_norm = normalize_feature(spectral_rolloff)
-    mfcc_norm = normalize_feature(mfcc_mean)
-    
-    # Multi-level thresholding approach
-    # Level 1: Energy-based detection (conservative)
-    energy_threshold = np.percentile(rms, 25)  # Bottom 25% is likely silence
-    energy_voice = rms > energy_threshold
-    
-    # Level 2: Spectral characteristics (moderate)
-    zcr_min, zcr_max = np.percentile(zcr, [15, 85])  # Speech has moderate ZCR
-    centroid_threshold = np.percentile(spectral_centroid, 30)  # Speech has higher centroid than noise
-    
-    spectral_voice = (zcr >= zcr_min) & (zcr <= zcr_max) & (spectral_centroid > centroid_threshold)
-    
-    # Level 3: Advanced features (aggressive)
-    # Combine MFCC and rolloff information
-    rolloff_threshold = np.percentile(spectral_rolloff, 35)
-    advanced_voice = (spectral_rolloff > rolloff_threshold) & (mfcc_mean > np.percentile(mfcc_mean, 25))
-    
-    # Voting mechanism: at least 2 out of 3 levels must agree
-    vote_count = energy_voice.astype(int) + spectral_voice.astype(int) + advanced_voice.astype(int)
-    final_voice_frames = vote_count >= 2
-    
-    # Apply median filtering to smooth the results
-    final_voice_frames = medfilt(final_voice_frames.astype(int), kernel_size=3).astype(bool)
-    
-    # Convert frame-level decisions to sample-level mask
-    voice_mask = np.repeat(final_voice_frames, hop_length)[:len(audio)]
-    
-    # Apply morphological operations for final cleanup
-    voice_mask = binary_dilation(voice_mask, iterations=2)
-    voice_mask = binary_erosion(voice_mask, iterations=1)
-    
-    return voice_mask
+    try:
+        import webrtcvad
+        
+        vad = webrtcvad.Vad(2)
+        audio_16bit = (audio * 32767).astype(np.int16)
+        frame_size = int(sr * frame_duration / 1000)
+        
+        padding = frame_size - (len(audio_16bit) % frame_size)
+        if padding != frame_size:
+            audio_16bit = np.pad(audio_16bit, (0, padding), mode='constant')
+        
+        voice_frames = []
+        for i in range(0, len(audio_16bit), frame_size):
+            frame = audio_16bit[i:i+frame_size].tobytes()
+            try:
+                is_speech = vad.is_speech(frame, sr)
+            except:
+                is_speech = False
+            voice_frames.append(is_speech)
+        
+        voice_mask = np.repeat(voice_frames, frame_size)[:len(audio)]
+        voice_mask = binary_dilation(voice_mask, iterations=2)
+        voice_mask = binary_erosion(voice_mask, iterations=1)
+        
+        logger.info("Using WebRTC VAD")
+        return voice_mask
+        
+    except ImportError:
+        logger.warning("webrtcvad not available, using fallback VAD")
+        
+        # Fallback VAD implementation
+        import librosa
+        from scipy.signal import medfilt
+        
+        frame_length = int(sr * frame_duration / 1000)
+        hop_length = frame_length // 2
+        
+        # RMS Energy
+        rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+        
+        # Zero Crossing Rate
+        zcr = librosa.feature.zero_crossing_rate(audio, frame_length=frame_length, hop_length=hop_length)[0]
+        
+        # Spectral Centroid
+        spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=hop_length)[0]
+        
+        # Simple thresholds
+        energy_threshold = np.percentile(rms, 25)
+        zcr_min, zcr_max = np.percentile(zcr, [15, 85])
+        centroid_threshold = np.percentile(spectral_centroid, 30)
+        
+        # Voice activity detection
+        energy_voice = rms > energy_threshold
+        spectral_voice = (zcr >= zcr_min) & (zcr <= zcr_max) & (spectral_centroid > centroid_threshold)
+        
+        # Simple voting
+        voice_frames = energy_voice | spectral_voice
+        voice_frames = medfilt(voice_frames.astype(int), kernel_size=3).astype(bool)
+        
+        # Convert to sample-level mask
+        voice_mask = np.repeat(voice_frames, hop_length)[:len(audio)]
+        voice_mask = binary_dilation(voice_mask, iterations=2)
+        voice_mask = binary_erosion(voice_mask, iterations=1)
+        
+        return voice_mask
 
 def bandpass_filter(audio, sr, low_freq=300, high_freq=3400):
-    """Apply bandpass filter optimized for speech frequencies"""
     from scipy.signal import butter, filtfilt
     import numpy as np
     
     nyquist = sr / 2
-    low = low_freq / nyquist
-    high = high_freq / nyquist
-    
-    # Ensure frequencies are within valid range
-    low = max(0.001, min(low, 0.999))
-    high = max(low + 0.001, min(high, 0.999))
+    low = max(0.001, min(low_freq / nyquist, 0.999))
+    high = max(low + 0.001, min(high_freq / nyquist, 0.999))
     
     b, a = butter(4, [low, high], btype='band')
     return filtfilt(b, a, audio)
 
 def adaptive_spectral_subtraction(audio, sr, alpha=1.5, beta=0.02):
-    """Memory-efficient adaptive spectral subtraction"""
     import librosa
     import numpy as np
     
-    chunk_size = sr * 10  # Process 10 seconds at a time
     n_fft = 512
     hop_length = 256
-    
-    if len(audio) <= chunk_size:
-        return _process_spectral_chunk(audio, sr, alpha, beta, n_fft, hop_length)
-    
-    # Process large files in chunks
-    processed_chunks = []
-    overlap = n_fft
-    
-    for start in range(0, len(audio), chunk_size - overlap):
-        end = min(start + chunk_size, len(audio))
-        chunk = audio[start:end]
-        
-        processed_chunk = _process_spectral_chunk(chunk, sr, alpha, beta, n_fft, hop_length)
-        
-        if start > 0:
-            processed_chunk = processed_chunk[overlap//2:]
-        
-        processed_chunks.append(processed_chunk)
-    
-    return np.concatenate(processed_chunks)
-
-def _process_spectral_chunk(audio, sr, alpha, beta, n_fft, hop_length):
-    """Process a single chunk with spectral subtraction"""
-    import librosa
-    import numpy as np
     
     stft = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
     magnitude = np.abs(stft)
@@ -242,36 +174,9 @@ def _process_spectral_chunk(audio, sr, alpha, beta, n_fft, hop_length):
     
     return clean_audio
 
-def multi_band_dynamic_range_compression(audio, sr):
-    """Apply frequency-specific compression"""
-    import numpy as np
-    
-    # Split into frequency bands
-    low_band = bandpass_filter(audio, sr, 150, 500)
-    mid_band = bandpass_filter(audio, sr, 500, 2000)
-    high_band = bandpass_filter(audio, sr, 2000, 3400)
-    
-    def compress_band(band, threshold=0.2, ratio=3.0):
-        compressed = band.copy()
-        above_threshold = np.abs(band) > threshold
-        compressed[above_threshold] = np.sign(band[above_threshold]) * (
-            threshold + (np.abs(band[above_threshold]) - threshold) / ratio
-        )
-        return compressed
-    
-    low_compressed = compress_band(low_band, threshold=0.15, ratio=2.5)
-    mid_compressed = compress_band(mid_band, threshold=0.25, ratio=3.0)
-    high_compressed = compress_band(high_band, threshold=0.3, ratio=4.0)
-    
-    return 0.3 * low_compressed + 0.5 * mid_compressed + 0.2 * high_compressed
-
-def automatic_gain_control(audio, target_rms=0.1, attack_time=0.005, release_time=0.05, sr=16000):
-    """Fast AGC specifically tuned for speech"""
+def automatic_gain_control(audio, target_rms=0.1, sr=16000):
     import numpy as np
     from scipy.signal import medfilt
-    
-    attack_samples = int(attack_time * sr)
-    release_samples = int(release_time * sr)
     
     window_size = 512
     hop_size = 256
@@ -290,49 +195,18 @@ def automatic_gain_control(audio, target_rms=0.1, attack_time=0.005, release_tim
     
     for rms in rms_values:
         if rms > 0:
-            target_gain = target_rms / rms
-            target_gain = np.clip(target_gain, 0.1, 10.0)
-            
-            if target_gain < current_gain:
-                current_gain = current_gain + (target_gain - current_gain) / attack_samples
-            else:
-                current_gain = current_gain + (target_gain - current_gain) / release_samples
-        
+            target_gain = np.clip(target_rms / rms, 0.1, 10.0)
+            current_gain = current_gain + (target_gain - current_gain) * 0.1
         gains.append(current_gain)
     
-    # Interpolate gains to match audio length
+    # Interpolate gains
     gain_indices = np.arange(0, len(audio), hop_size)[:len(gains)]
     audio_indices = np.arange(len(audio))
     interpolated_gains = np.interp(audio_indices, gain_indices, gains)
     
     return audio * interpolated_gains
 
-def speaker_transition_enhancement(audio, sr):
-    """Enhance speaker transitions by emphasizing spectral changes"""
-    import librosa
-    import numpy as np
-    
-    # Compute spectral centroid over time
-    centroids = librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=512)[0]
-    
-    # Find rapid changes (potential speaker transitions)
-    centroid_diff = np.abs(np.diff(centroids))
-    transition_threshold = np.percentile(centroid_diff, 80)
-    
-    # Create enhancement mask
-    enhancement_mask = np.ones_like(audio)
-    
-    # For each significant transition, apply local enhancement
-    for i, diff in enumerate(centroid_diff):
-        if diff > transition_threshold:
-            start_sample = i * 512
-            end_sample = min(start_sample + 1024, len(audio))
-            enhancement_mask[start_sample:end_sample] *= 1.1
-    
-    return audio * enhancement_mask
-
 def speaker_aware_silence_removal(audio, voice_mask, min_gap_ms=200, padding_ms=100, sr=16000):
-    """Intelligent silence removal that preserves speaker transitions"""
     import numpy as np
     
     min_gap_samples = int(min_gap_ms * sr / 1000)
@@ -360,12 +234,12 @@ def speaker_aware_silence_removal(audio, voice_mask, min_gap_ms=200, padding_ms=
         start = voice_starts[i]
         end = voice_ends[i] if i < len(voice_ends) else len(voice_mask)
         
-        # Add padding around voice regions
+        # Add padding
         pad_start = max(0, start - padding_samples)
         pad_end = min(len(voice_mask), end + padding_samples)
         enhanced_mask[pad_start:pad_end] = True
         
-        # If gap to next voice region is small, include it
+        # Connect small gaps
         if i < len(voice_starts) - 1:
             next_start = voice_starts[i + 1]
             gap_size = next_start - end
@@ -375,69 +249,46 @@ def speaker_aware_silence_removal(audio, voice_mask, min_gap_ms=200, padding_ms=
     return audio[enhanced_mask]
 
 def quality_improvement_processing(audio, sr):
-    """
-    Step 1: Enhanced quality improvement processing
-    """
     import librosa
     import numpy as np
     
-    logger.info("Step 1: Applying enhanced quality improvements...")
+    logger.info("Step 1: Quality improvement processing...")
     
-    # 1.1: Enhanced bandpass filter
-    logger.info("  - Applying enhanced bandpass filter...")
-    audio_filtered = bandpass_filter(audio, sr, low_freq=300, high_freq=3400)
+    # Bandpass filter
+    audio_filtered = bandpass_filter(audio, sr)
     
-    # 1.2: Adaptive spectral subtraction (better than simple noise reduction)
-    logger.info("  - Applying adaptive spectral subtraction...")
+    # Spectral subtraction
     audio_denoised = adaptive_spectral_subtraction(audio_filtered, sr)
     
-    # 1.3: Multi-band compression
-    logger.info("  - Applying multi-band compression...")
-    audio_compressed = multi_band_dynamic_range_compression(audio_denoised, sr)
+    # Automatic gain control
+    audio_agc = automatic_gain_control(audio_denoised, sr=sr)
     
-    # 1.4: Enhanced normalization
-    logger.info("  - Applying enhanced normalization...")
-    audio_normalized = librosa.util.normalize(audio_compressed)
+    # Normalization
+    audio_final = librosa.util.normalize(audio_agc)
     
-    # 1.5: Preemphasis for speech clarity
-    logger.info("  - Applying preemphasis...")
-    audio_final = librosa.effects.preemphasis(audio_normalized, coef=0.95)
-    
-    # Validate output
+    # Validate
     if np.any(np.isnan(audio_final)) or np.any(np.isinf(audio_final)):
         raise ValueError("Step 1 processing produced invalid values")
     
-    logger.info("Step 1 complete: Enhanced quality improvement finished")
+    logger.info("Step 1 complete")
     return audio_final
 
 def enhanced_diarization_processing(audio, sr):
-    """
-    Step 2: Enhanced processing for speaker diarization with advanced techniques
-    """
     import librosa
     import numpy as np
     
-    logger.info("Step 2: Applying advanced diarization enhancements...")
+    logger.info("Step 2: Diarization processing...")
     
-    # 2.1: Enhanced Voice Activity Detection (on original improved audio)
-    logger.info("  - Performing enhanced voice activity detection...")
+    # Voice Activity Detection
     voice_mask = enhanced_voice_activity_detection(audio, sr)
     voice_ratio = np.sum(voice_mask) / len(voice_mask)
-    logger.info(f"  - Voice activity detected: {voice_ratio:.1%} of audio")
+    logger.info(f"Voice activity: {voice_ratio:.1%}")
     
-    # 2.2: Speaker transition enhancement
-    logger.info("  - Enhancing speaker transitions...")
-    audio_transitions = speaker_transition_enhancement(audio, sr)
+    # Apply AGC again for speaker balancing
+    audio_agc = automatic_gain_control(audio, sr=sr)
     
-    # 2.3: Fast automatic gain control for speaker level balancing
-    logger.info("  - Applying fast automatic gain control...")
-    audio_agc = automatic_gain_control(audio_transitions, sr=sr)
-    
-    # 2.4: Speaker-aware silence removal
-    logger.info("  - Applying speaker-aware silence removal...")
-    # Adjust voice mask if audio length changed
+    # Remove silence intelligently
     if len(audio_agc) != len(voice_mask):
-        logger.info(f"  - Adjusting voice mask: original {len(voice_mask)}, current {len(audio_agc)}")
         if len(audio_agc) < len(voice_mask):
             voice_mask = voice_mask[:len(audio_agc)]
         else:
@@ -449,37 +300,27 @@ def enhanced_diarization_processing(audio, sr):
     # Final normalization
     audio_final = librosa.util.normalize(audio_final)
     
-    # Validate output
     if np.any(np.isnan(audio_final)) or np.any(np.isinf(audio_final)):
         raise ValueError("Step 2 processing produced invalid values")
     
-    logger.info("Step 2 complete: Advanced diarization enhancements finished")
+    logger.info("Step 2 complete")
     return audio_final
 
-# -----------------------------
-# DAG Definition
-# -----------------------------
 with DAG(
-    dag_id='enhanced_two_step_audio_processing',
+    dag_id='fixed_audio_processing',
     schedule_interval='0 */12 * * *',
     start_date=days_ago(1),
-    tags=['audio', 'processing', 'enhanced', 'diarization'],
+    tags=['audio', 'processing', 'fixed'],
     catchup=False,
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
 ) as dag:
 
     @task
     def list_raw_files():
-        """List all WAV files in the raw bucket with validation"""
         try:
             s3 = get_s3_client()
-            bucket = "audio-raw"
-            
-            logger.info(f"Listing files in bucket: {bucket}")
-            resp = s3.list_objects_v2(Bucket=bucket)
+            resp = s3.list_objects_v2(Bucket="audio-raw")
             
             if 'Contents' not in resp:
-                logger.warning("No files found in raw bucket")
                 return []
             
             files = []
@@ -488,44 +329,29 @@ with DAG(
                 if key.lower().endswith(".wav"):
                     size_mb = obj["Size"] / (1024 * 1024)
                     if 0.1 <= size_mb <= 500:
-                        files.append({
-                            'key': key,
-                            'size_mb': size_mb,
-                            'last_modified': obj['LastModified'].isoformat()
-                        })
-                        logger.info(f"Found valid WAV file: {key} ({size_mb:.2f}MB)")
-                    else:
-                        logger.warning(f"Skipping {key}: invalid size {size_mb:.2f}MB")
+                        files.append({'key': key, 'size_mb': size_mb})
             
-            logger.info(f"Found {len(files)} valid WAV files")
             return files
             
         except Exception as e:
-            logger.error(f"Failed to list raw files: {str(e)}")
+            logger.error(f"Failed to list files: {str(e)}")
             raise
 
     @task
-    def process_all_files_step1(file_list):
-        """Step 1: Enhanced quality improvement processing"""
+    def process_step1(file_list):
         if not file_list:
-            logger.warning("No files to process")
             return []
         
-        # Install packages once for all files
         try:
             install_audio_packages()
         except Exception as e:
-            logger.error(f"Package installation failed: {str(e)}")
-            return [{"status": "failed", "error": f"Package installation failed: {str(e)}", "step": "package_install"}]
+            return [{"status": "failed", "error": str(e), "step": "install"}]
         
         import librosa
         import soundfile as sf
         import numpy as np
         
         s3 = get_s3_client()
-        input_bucket = "audio-raw"
-        output_bucket = "audio-improved"
-        
         results = []
         
         for file_info in file_list:
@@ -533,285 +359,109 @@ with DAG(
             output_key = file_key.replace(".wav", "_improved.wav")
             
             try:
-                # Check if already processed
+                # Check if exists
                 try:
-                    existing_obj = s3.head_object(Bucket=output_bucket, Key=output_key)
-                    existing_size = existing_obj['ContentLength']
-                    
-                    if existing_size > 1000:
-                        logger.info(f"Step 1: Skipping {file_key}, already improved")
-                        results.append({
-                            "status": "skipped", 
-                            "reason": "already_improved", 
-                            "output_key": output_key,
-                            "file_key": file_key
-                        })
+                    existing = s3.head_object(Bucket="audio-improved", Key=output_key)
+                    if existing['ContentLength'] > 1000:
+                        results.append({"status": "skipped", "file_key": file_key, "output_key": output_key})
                         continue
-                        
-                except s3.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] != '404':
-                        logger.error(f"Error checking existing file: {str(e)}")
-                        results.append({
-                            "status": "failed",
-                            "error": f"S3 check failed: {str(e)}",
-                            "file_key": file_key,
-                            "step": "step1"
-                        })
-                        continue
+                except:
+                    pass
                 
-                # Download and load audio
-                logger.info(f"Step 1: Processing {file_key}")
-                obj = s3.get_object(Bucket=input_bucket, Key=file_key)
+                # Process
+                obj = s3.get_object(Bucket="audio-raw", Key=file_key)
                 audio_bytes = BytesIO(obj['Body'].read())
-                original_size = len(audio_bytes.getvalue())
                 
-                logger.info(f"  - Loading audio file...")
                 audio, sr = librosa.load(audio_bytes, sr=16000)
-                validate_audio_file(audio, sr)
-                
-                # Apply Enhanced Step 1 processing
                 audio_improved = quality_improvement_processing(audio, sr)
                 
-                # Save improved audio
-                logger.info(f"  - Saving improved audio...")
+                # Save
                 buf = BytesIO()
                 sf.write(buf, audio_improved, sr, format='WAV', subtype='PCM_16')
                 buf.seek(0)
-                improved_data = buf.getvalue()
-                improved_size = len(improved_data)
                 
-                if improved_size < 1000:
-                    raise ValueError(f"Improved file too small: {improved_size} bytes")
+                s3.put_object(Bucket="audio-improved", Key=output_key, Body=buf.getvalue())
                 
-                s3.put_object(
-                    Bucket=output_bucket, 
-                    Key=output_key, 
-                    Body=improved_data,
-                    Metadata={
-                        'original_file': file_key,
-                        'original_size': str(original_size),
-                        'improved_size': str(improved_size),
-                        'sample_rate': str(sr),
-                        'processing_step': 'step1_enhanced_quality',
-                        'processing_version': '2.0'
-                    }
-                )
-                
-                logger.info(f"  - Successfully improved: {output_key} ({improved_size} bytes)")
-                
-                results.append({
-                    "status": "success",
-                    "original_size": original_size,
-                    "improved_size": improved_size,
-                    "sample_rate": sr,
-                    "output_key": output_key,
-                    "file_key": file_key
-                })
+                results.append({"status": "success", "file_key": file_key, "output_key": output_key})
                 
             except Exception as e:
-                logger.error(f"Step 1 processing failed for {file_key}: {str(e)}")
-                results.append({
-                    "status": "failed",
-                    "error": str(e),
-                    "file_key": file_key,
-                    "step": "step1"
-                })
+                results.append({"status": "failed", "file_key": file_key, "error": str(e)})
         
         return results
 
     @task
-    def process_all_files_step2(step1_results):
-        """Step 2: Advanced diarization optimization processing"""
+    def process_step2(step1_results):
         if not step1_results:
-            logger.warning("No step1 results to process")
             return []
         
-        # Filter for successful step1 results
-        successful_files = [r for r in step1_results if r.get('status') == 'success']
-        
-        if not successful_files:
-            logger.warning("No successful step1 files to process in step2")
+        successful = [r for r in step1_results if r.get('status') == 'success']
+        if not successful:
             return step1_results
         
-        # Install packages
         try:
             install_audio_packages()
         except Exception as e:
-            logger.error(f"Package installation failed in step2: {str(e)}")
-            failed_results = []
-            for result in step1_results:
-                if result.get('status') == 'success':
-                    failed_results.append({
-                        "status": "failed",
-                        "error": f"Step2 package installation failed: {str(e)}",
-                        "file_key": result.get('file_key'),
-                        "step": "step2_package_install"
-                    })
-                else:
-                    failed_results.append(result)
-            return failed_results
+            return [{"status": "failed", "error": str(e), "step": "install"}]
         
         import librosa
         import soundfile as sf
         import numpy as np
         
         s3 = get_s3_client()
-        input_bucket = "audio-improved"
-        output_bucket = "audio-enhanced"
-        
         results = []
         
-        for file_result in step1_results:
-            if file_result.get('status') != 'success':
-                results.append(file_result)
+        for result in step1_results:
+            if result.get('status') != 'success':
+                results.append(result)
                 continue
-            
-            file_key = file_result['file_key']
-            improved_key = file_result['output_key']
+                
+            file_key = result['file_key']
+            improved_key = result['output_key']
             output_key = file_key.replace(".wav", "_enhanced.wav")
             
             try:
-                # Check if already processed
+                # Check if exists
                 try:
-                    existing_obj = s3.head_object(Bucket=output_bucket, Key=output_key)
-                    existing_size = existing_obj['ContentLength']
-                    
-                    if existing_size > 1000:
-                        logger.info(f"Step 2: Skipping {file_key}, already enhanced")
-                        results.append({
-                            "status": "skipped", 
-                            "reason": "already_enhanced", 
-                            "output_key": output_key,
-                            "file_key": file_key
-                        })
+                    existing = s3.head_object(Bucket="audio-enhanced", Key=output_key)
+                    if existing['ContentLength'] > 1000:
+                        results.append({"status": "skipped", "file_key": file_key, "output_key": output_key})
                         continue
-                        
-                except s3.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] != '404':
-                        logger.error(f"Error checking existing file: {str(e)}")
-                        results.append({
-                            "status": "failed",
-                            "error": f"S3 check failed: {str(e)}",
-                            "file_key": file_key,
-                            "step": "step2"
-                        })
-                        continue
+                except:
+                    pass
                 
-                # Download improved audio from step 1
-                logger.info(f"Step 2: Processing {file_key}")
-                obj = s3.get_object(Bucket=input_bucket, Key=improved_key)
+                # Process
+                obj = s3.get_object(Bucket="audio-improved", Key=improved_key)
                 audio_bytes = BytesIO(obj['Body'].read())
-                improved_size = len(audio_bytes.getvalue())
                 
-                logger.info(f"  - Loading improved audio file...")
                 audio, sr = librosa.load(audio_bytes, sr=16000)
-                validate_audio_file(audio, sr)
-                
-                # Apply Enhanced Step 2 processing
                 audio_enhanced = enhanced_diarization_processing(audio, sr)
                 
-                # Save enhanced audio
-                logger.info(f"  - Saving enhanced audio...")
+                # Save
                 buf = BytesIO()
                 sf.write(buf, audio_enhanced, sr, format='WAV', subtype='PCM_16')
                 buf.seek(0)
-                enhanced_data = buf.getvalue()
-                enhanced_size = len(enhanced_data)
                 
-                if enhanced_size < 1000:
-                    raise ValueError(f"Enhanced file too small: {enhanced_size} bytes")
+                s3.put_object(Bucket="audio-enhanced", Key=output_key, Body=buf.getvalue())
                 
-                s3.put_object(
-                    Bucket=output_bucket, 
-                    Key=output_key, 
-                    Body=enhanced_data,
-                    Metadata={
-                        'original_file': file_key,
-                        'improved_file': improved_key,
-                        'improved_size': str(improved_size),
-                        'enhanced_size': str(enhanced_size),
-                        'sample_rate': str(sr),
-                        'processing_step': 'step2_advanced_diarization',
-                        'processing_version': '2.0'
-                    }
-                )
-                
-                logger.info(f"  - Successfully enhanced: {output_key} ({enhanced_size} bytes)")
-                
-                results.append({
-                    "status": "success",
-                    "improved_size": improved_size,
-                    "enhanced_size": enhanced_size,
-                    "sample_rate": sr,
-                    "output_key": output_key,
-                    "file_key": file_key,
-                    "step1_output": improved_key
-                })
+                results.append({"status": "success", "file_key": file_key, "output_key": output_key})
                 
             except Exception as e:
-                logger.error(f"Step 2 processing failed for {file_key}: {str(e)}")
-                results.append({
-                    "status": "failed",
-                    "error": str(e),
-                    "file_key": file_key,
-                    "step": "step2"
-                })
+                results.append({"status": "failed", "file_key": file_key, "error": str(e)})
         
         return results
 
     @task
-    def summarize_results(process_results):
-        """Summarize enhanced processing results"""
-        total_files = len(process_results)
-        step1_successful = sum(1 for r in process_results if r.get('status') == 'success' and 'improved_size' in r)
-        step2_successful = sum(1 for r in process_results if r.get('status') == 'success' and 'enhanced_size' in r)
-        skipped = sum(1 for r in process_results if r.get('status') == 'skipped')
-        failed = sum(1 for r in process_results if r.get('status') == 'failed')
+    def summarize_results(results):
+        total = len(results)
+        success = sum(1 for r in results if r.get('status') == 'success')
+        failed = sum(1 for r in results if r.get('status') == 'failed')
+        skipped = sum(1 for r in results if r.get('status') == 'skipped')
         
-        logger.info(f"Enhanced Two-Step Processing Summary:")
-        logger.info(f"  Total files: {total_files}")
-        logger.info(f"  Step 1 (Enhanced Quality) successful: {step1_successful}")
-        logger.info(f"  Step 2 (Advanced Diarization) successful: {step2_successful}")
-        logger.info(f"  Skipped: {skipped}")
-        logger.info(f"  Failed: {failed}")
-        
-        # Calculate processing improvements
-        total_original_size = sum(r.get('original_size', 0) for r in process_results if r.get('original_size'))
-        total_enhanced_size = sum(r.get('enhanced_size', 0) for r in process_results if r.get('enhanced_size'))
-        
-        if total_original_size > 0:
-            compression_ratio = total_enhanced_size / total_original_size
-            logger.info(f"  Audio compression ratio: {compression_ratio:.2f}")
-        
-        # Log failed files with detailed step information
-        for result in process_results:
-            if result.get('status') == 'failed':
-                step = result.get('step', 'unknown')
-                logger.error(f"Failed at {step}: {result.get('file_key')} - {result.get('error')}")
-        
-        # Log quality improvements
-        successful_results = [r for r in process_results if r.get('status') == 'success' and 'enhanced_size' in r]
-        if successful_results:
-            logger.info(f"Enhanced processing optimized {len(successful_results)} files for:")
-            logger.info(f"  - Improved speaker diarization accuracy")
-            logger.info(f"  - Better transcription quality")
-            logger.info(f"  - Enhanced voice activity detection")
-            logger.info(f"  - Speaker transition preservation")
-        
-        return {
-            "total": total_files,
-            "step1_successful": step1_successful,
-            "step2_successful": step2_successful,
-            "skipped": skipped,
-            "failed": failed,
-            "compression_ratio": compression_ratio if total_original_size > 0 else None,
-            "processing_version": "2.0_enhanced"
-        }
+        logger.info(f"Processing complete: {success} success, {failed} failed, {skipped} skipped")
+        return {"total": total, "success": success, "failed": failed, "skipped": skipped}
 
-    # -----------------------------
     # DAG Flow
-    # -----------------------------
-    raw_files = list_raw_files()
-    step1_results = process_all_files_step1(raw_files)
-    step2_results = process_all_files_step2(step1_results)
-    summary = summarize_results(step2_results)
+    files = list_raw_files()
+    step1 = process_step1(files)
+    step2 = process_step2(step1)
+    summary = summarize_results(step2)
