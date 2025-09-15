@@ -62,7 +62,7 @@ def install_audio_packages():
         ["pip", "install", "--quiet", "--no-cache-dir"] + packages,
         capture_output=True,
         text=True,
-        timeout=600
+        timeout=900  # Increased to 15 minutes
     )
     
     if result.returncode != 0:
@@ -375,200 +375,267 @@ with DAG(
             raise
 
     @task
-    def process_step1_quality_improvement(file_info: dict):
-        """Step 1: Apply general quality improvement"""
-        file_key = file_info['key']
+    def process_all_files_step1(file_list):
+        """Step 1: Process all files for quality improvement in a single task"""
+        if not file_list:
+            logger.warning("No files to process")
+            return []
         
+        # Install packages once for all files
         try:
             install_audio_packages()
-            
-            import librosa
-            import soundfile as sf
-            import numpy as np
-            
-            s3 = get_s3_client()
-            input_bucket = "audio-raw"
-            output_bucket = "audio-improved"
+        except Exception as e:
+            logger.error(f"Package installation failed: {str(e)}")
+            return [{"status": "failed", "error": f"Package installation failed: {str(e)}", "step": "package_install"}]
+        
+        import librosa
+        import soundfile as sf
+        import numpy as np
+        
+        s3 = get_s3_client()
+        input_bucket = "audio-raw"
+        output_bucket = "audio-improved"
+        
+        results = []
+        
+        for file_info in file_list:
+            file_key = file_info['key']
             output_key = file_key.replace(".wav", "_improved.wav")
             
-            # Check if already processed
             try:
-                existing_obj = s3.head_object(Bucket=output_bucket, Key=output_key)
-                existing_size = existing_obj['ContentLength']
-                
-                if existing_size > 1000:
-                    logger.info(f"Step 1: Skipping {file_key}, already improved ({existing_size} bytes)")
-                    return {"status": "skipped", "reason": "already_improved", "output_key": output_key}
+                # Check if already processed
+                try:
+                    existing_obj = s3.head_object(Bucket=output_bucket, Key=output_key)
+                    existing_size = existing_obj['ContentLength']
                     
-            except s3.exceptions.ClientError as e:
-                if e.response['Error']['Code'] != '404':
-                    logger.error(f"Error checking existing file: {str(e)}")
-                    raise
-            
-            # Download and load audio
-            logger.info(f"Step 1: Downloading {file_key} from {input_bucket}")
-            obj = s3.get_object(Bucket=input_bucket, Key=file_key)
-            audio_bytes = BytesIO(obj['Body'].read())
-            original_size = len(audio_bytes.getvalue())
-            
-            logger.info("Step 1: Loading audio file...")
-            audio, sr = librosa.load(audio_bytes, sr=16000)  # Standardize to 16kHz
-            validate_audio_file(audio, sr)
-            
-            # Apply Step 1 processing
-            audio_improved = quality_improvement_processing(audio, sr)
-            
-            # Save improved audio
-            logger.info("Step 1: Saving improved audio...")
-            buf = BytesIO()
-            sf.write(buf, audio_improved, sr, format='WAV', subtype='PCM_16')
-            buf.seek(0)
-            improved_data = buf.getvalue()
-            improved_size = len(improved_data)
-            
-            if improved_size < 1000:
-                raise ValueError(f"Improved file too small: {improved_size} bytes")
-            
-            s3.put_object(
-                Bucket=output_bucket, 
-                Key=output_key, 
-                Body=improved_data,
-                Metadata={
-                    'original_file': file_key,
-                    'original_size': str(original_size),
-                    'improved_size': str(improved_size),
-                    'sample_rate': str(sr),
-                    'processing_step': 'step1_quality_improvement',
-                    'processing_version': '1.0'
-                }
-            )
-            
-            logger.info(f"Step 1: Successfully improved and uploaded: {output_key} ({improved_size} bytes)")
-            
-            return {
-                "status": "success",
-                "original_size": original_size,
-                "improved_size": improved_size,
-                "sample_rate": sr,
-                "output_key": output_key,
-                "file_key": file_key
-            }
-            
-        except Exception as e:
-            logger.error(f"Step 1 processing failed for {file_key}: {str(e)}")
-            return {
-                "status": "failed",
-                "error": str(e),
-                "file_key": file_key,
-                "step": "step1"
-            }
+                    if existing_size > 1000:
+                        logger.info(f"Step 1: Skipping {file_key}, already improved ({existing_size} bytes)")
+                        results.append({
+                            "status": "skipped", 
+                            "reason": "already_improved", 
+                            "output_key": output_key,
+                            "file_key": file_key
+                        })
+                        continue
+                        
+                except s3.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] != '404':
+                        logger.error(f"Error checking existing file: {str(e)}")
+                        results.append({
+                            "status": "failed",
+                            "error": f"S3 check failed: {str(e)}",
+                            "file_key": file_key,
+                            "step": "step1"
+                        })
+                        continue
+                
+                # Download and load audio
+                logger.info(f"Step 1: Processing {file_key}")
+                obj = s3.get_object(Bucket=input_bucket, Key=file_key)
+                audio_bytes = BytesIO(obj['Body'].read())
+                original_size = len(audio_bytes.getvalue())
+                
+                logger.info(f"  - Loading audio file...")
+                audio, sr = librosa.load(audio_bytes, sr=16000)
+                validate_audio_file(audio, sr)
+                
+                # Apply Step 1 processing
+                audio_improved = quality_improvement_processing(audio, sr)
+                
+                # Save improved audio
+                logger.info(f"  - Saving improved audio...")
+                buf = BytesIO()
+                sf.write(buf, audio_improved, sr, format='WAV', subtype='PCM_16')
+                buf.seek(0)
+                improved_data = buf.getvalue()
+                improved_size = len(improved_data)
+                
+                if improved_size < 1000:
+                    raise ValueError(f"Improved file too small: {improved_size} bytes")
+                
+                s3.put_object(
+                    Bucket=output_bucket, 
+                    Key=output_key, 
+                    Body=improved_data,
+                    Metadata={
+                        'original_file': file_key,
+                        'original_size': str(original_size),
+                        'improved_size': str(improved_size),
+                        'sample_rate': str(sr),
+                        'processing_step': 'step1_quality_improvement',
+                        'processing_version': '1.0'
+                    }
+                )
+                
+                logger.info(f"  - Successfully improved and uploaded: {output_key} ({improved_size} bytes)")
+                
+                results.append({
+                    "status": "success",
+                    "original_size": original_size,
+                    "improved_size": improved_size,
+                    "sample_rate": sr,
+                    "output_key": output_key,
+                    "file_key": file_key
+                })
+                
+            except Exception as e:
+                logger.error(f"Step 1 processing failed for {file_key}: {str(e)}")
+                results.append({
+                    "status": "failed",
+                    "error": str(e),
+                    "file_key": file_key,
+                    "step": "step1"
+                })
+        
+        return results
 
     @task
-    def process_step2_enhanced_diarization(step1_result: dict):
-        """Step 2: Apply enhanced processing for speaker diarization"""
-        if step1_result.get('status') != 'success':
-            logger.warning(f"Skipping step 2 for {step1_result.get('file_key')} - step 1 failed")
-            return step1_result
+    def process_all_files_step2(step1_results):
+        """Step 2: Process all successful files for diarization optimization"""
+        if not step1_results:
+            logger.warning("No step1 results to process")
+            return []
         
-        file_key = step1_result['file_key']
-        improved_key = step1_result['output_key']
+        # Filter for successful step1 results
+        successful_files = [r for r in step1_results if r.get('status') == 'success']
         
+        if not successful_files:
+            logger.warning("No successful step1 files to process in step2")
+            return step1_results
+        
+        # Install packages once for all files (reuse from step1 if same container)
         try:
             install_audio_packages()
+        except Exception as e:
+            logger.error(f"Package installation failed in step2: {str(e)}")
+            # Mark all successful files as failed due to package installation
+            failed_results = []
+            for result in step1_results:
+                if result.get('status') == 'success':
+                    failed_results.append({
+                        "status": "failed",
+                        "error": f"Step2 package installation failed: {str(e)}",
+                        "file_key": result.get('file_key'),
+                        "step": "step2_package_install"
+                    })
+                else:
+                    failed_results.append(result)
+            return failed_results
+        
+        import librosa
+        import soundfile as sf
+        import numpy as np
+        
+        s3 = get_s3_client()
+        input_bucket = "audio-improved"
+        output_bucket = "audio-enhanced"
+        
+        results = []
+        
+        for file_result in step1_results:
+            if file_result.get('status') != 'success':
+                # Pass through non-successful results unchanged
+                results.append(file_result)
+                continue
             
-            import librosa
-            import soundfile as sf
-            import numpy as np
-            
-            s3 = get_s3_client()
-            input_bucket = "audio-improved"
-            output_bucket = "audio-enhanced"
+            file_key = file_result['file_key']
+            improved_key = file_result['output_key']
             output_key = file_key.replace(".wav", "_enhanced.wav")
             
-            # Check if already processed
             try:
-                existing_obj = s3.head_object(Bucket=output_bucket, Key=output_key)
-                existing_size = existing_obj['ContentLength']
-                
-                if existing_size > 1000:
-                    logger.info(f"Step 2: Skipping {file_key}, already enhanced ({existing_size} bytes)")
-                    return {
-                        "status": "skipped", 
-                        "reason": "already_enhanced", 
-                        "output_key": output_key,
-                        "file_key": file_key
-                    }
+                # Check if already processed
+                try:
+                    existing_obj = s3.head_object(Bucket=output_bucket, Key=output_key)
+                    existing_size = existing_obj['ContentLength']
                     
-            except s3.exceptions.ClientError as e:
-                if e.response['Error']['Code'] != '404':
-                    logger.error(f"Error checking existing file: {str(e)}")
-                    raise
-            
-            # Download improved audio from step 1
-            logger.info(f"Step 2: Downloading {improved_key} from {input_bucket}")
-            obj = s3.get_object(Bucket=input_bucket, Key=improved_key)
-            audio_bytes = BytesIO(obj['Body'].read())
-            improved_size = len(audio_bytes.getvalue())
-            
-            logger.info("Step 2: Loading improved audio file...")
-            audio, sr = librosa.load(audio_bytes, sr=16000)
-            validate_audio_file(audio, sr)
-            
-            # Apply Step 2 processing
-            audio_enhanced = enhanced_diarization_processing(audio, sr)
-            
-            # Save enhanced audio
-            logger.info("Step 2: Saving enhanced audio...")
-            buf = BytesIO()
-            sf.write(buf, audio_enhanced, sr, format='WAV', subtype='PCM_16')
-            buf.seek(0)
-            enhanced_data = buf.getvalue()
-            enhanced_size = len(enhanced_data)
-            
-            if enhanced_size < 1000:
-                raise ValueError(f"Enhanced file too small: {enhanced_size} bytes")
-            
-            s3.put_object(
-                Bucket=output_bucket, 
-                Key=output_key, 
-                Body=enhanced_data,
-                Metadata={
-                    'original_file': file_key,
-                    'improved_file': improved_key,
-                    'improved_size': str(improved_size),
-                    'enhanced_size': str(enhanced_size),
-                    'sample_rate': str(sr),
-                    'processing_step': 'step2_enhanced_diarization',
-                    'processing_version': '1.0'
-                }
-            )
-            
-            logger.info(f"Step 2: Successfully enhanced and uploaded: {output_key} ({enhanced_size} bytes)")
-            
-            return {
-                "status": "success",
-                "improved_size": improved_size,
-                "enhanced_size": enhanced_size,
-                "sample_rate": sr,
-                "output_key": output_key,
-                "file_key": file_key,
-                "step1_output": improved_key
-            }
-            
-        except Exception as e:
-            logger.error(f"Step 2 processing failed for {file_key}: {str(e)}")
-            return {
-                "status": "failed",
-                "error": str(e),
-                "file_key": file_key,
-                "step": "step2"
-            }
+                    if existing_size > 1000:
+                        logger.info(f"Step 2: Skipping {file_key}, already enhanced ({existing_size} bytes)")
+                        results.append({
+                            "status": "skipped", 
+                            "reason": "already_enhanced", 
+                            "output_key": output_key,
+                            "file_key": file_key
+                        })
+                        continue
+                        
+                except s3.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] != '404':
+                        logger.error(f"Error checking existing file: {str(e)}")
+                        results.append({
+                            "status": "failed",
+                            "error": f"S3 check failed: {str(e)}",
+                            "file_key": file_key,
+                            "step": "step2"
+                        })
+                        continue
+                
+                # Download improved audio from step 1
+                logger.info(f"Step 2: Processing {file_key}")
+                obj = s3.get_object(Bucket=input_bucket, Key=improved_key)
+                audio_bytes = BytesIO(obj['Body'].read())
+                improved_size = len(audio_bytes.getvalue())
+                
+                logger.info(f"  - Loading improved audio file...")
+                audio, sr = librosa.load(audio_bytes, sr=16000)
+                validate_audio_file(audio, sr)
+                
+                # Apply Step 2 processing
+                audio_enhanced = enhanced_diarization_processing(audio, sr)
+                
+                # Save enhanced audio
+                logger.info(f"  - Saving enhanced audio...")
+                buf = BytesIO()
+                sf.write(buf, audio_enhanced, sr, format='WAV', subtype='PCM_16')
+                buf.seek(0)
+                enhanced_data = buf.getvalue()
+                enhanced_size = len(enhanced_data)
+                
+                if enhanced_size < 1000:
+                    raise ValueError(f"Enhanced file too small: {enhanced_size} bytes")
+                
+                s3.put_object(
+                    Bucket=output_bucket, 
+                    Key=output_key, 
+                    Body=enhanced_data,
+                    Metadata={
+                        'original_file': file_key,
+                        'improved_file': improved_key,
+                        'improved_size': str(improved_size),
+                        'enhanced_size': str(enhanced_size),
+                        'sample_rate': str(sr),
+                        'processing_step': 'step2_enhanced_diarization',
+                        'processing_version': '1.0'
+                    }
+                )
+                
+                logger.info(f"  - Successfully enhanced and uploaded: {output_key} ({enhanced_size} bytes)")
+                
+                results.append({
+                    "status": "success",
+                    "improved_size": improved_size,
+                    "enhanced_size": enhanced_size,
+                    "sample_rate": sr,
+                    "output_key": output_key,
+                    "file_key": file_key,
+                    "step1_output": improved_key
+                })
+                
+            except Exception as e:
+                logger.error(f"Step 2 processing failed for {file_key}: {str(e)}")
+                results.append({
+                    "status": "failed",
+                    "error": str(e),
+                    "file_key": file_key,
+                    "step": "step2"
+                })
+        
+        return results
 
     @task
     def summarize_results(process_results):
         """Summarize processing results for both steps"""
         total_files = len(process_results)
-        step1_successful = sum(1 for r in process_results if r.get('status') == 'success' and 'step1_output' in r)
+        step1_successful = sum(1 for r in process_results if r.get('status') == 'success' and 'improved_size' in r)
         step2_successful = sum(1 for r in process_results if r.get('status') == 'success' and 'enhanced_size' in r)
         skipped = sum(1 for r in process_results if r.get('status') == 'skipped')
         failed = sum(1 for r in process_results if r.get('status') == 'failed')
@@ -598,6 +665,6 @@ with DAG(
     # DAG Flow
     # -----------------------------
     raw_files = list_raw_files()
-    step1_results = process_step1_quality_improvement.expand(file_info=raw_files)
-    step2_results = process_step2_enhanced_diarization.expand(step1_result=step1_results)
+    step1_results = process_all_files_step1(raw_files)
+    step2_results = process_all_files_step2(step1_results)
     summary = summarize_results(step2_results)
