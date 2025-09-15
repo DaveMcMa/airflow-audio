@@ -60,7 +60,7 @@ def install_audio_packages():
     
     logger.info("Installing required audio packages...")
     result = subprocess.run(
-        ["pip", "install", "--quiet", "--no-cache-dir"] + packages,
+        ["pip", "install", "--quiet", "--no-cache-dir", "--only-binary=all"] + packages,
         capture_output=True,
         text=True,
         timeout=600
