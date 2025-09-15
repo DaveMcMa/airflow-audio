@@ -54,13 +54,12 @@ def install_audio_packages():
         "noisereduce==3.0.0", 
         "soundfile==0.12.1", 
         "numpy==1.24.3",
-        "scipy==1.10.1",
-        "webrtcvad==2.0.10"
+        "scipy==1.10.1"
     ]
     
     logger.info("Installing required audio packages...")
     result = subprocess.run(
-        ["pip", "install", "--quiet", "--no-cache-dir", "--only-binary=all"] + packages,
+        ["pip", "install", "--quiet", "--no-cache-dir"] + packages,
         capture_output=True,
         text=True,
         timeout=600
@@ -148,44 +147,42 @@ def enhanced_diarization_processing(audio, sr):
     """
     import librosa
     import numpy as np
-    import webrtcvad
     from scipy.signal import butter, filtfilt, medfilt
-    from scipy.ndimage import binary_dilation, binary_erosion
     
     logger.info("Step 2: Applying diarization enhancements...")
     
-    # 2.1: Enhanced Voice Activity Detection
-    def enhanced_voice_activity_detection(audio, sr, frame_duration=20):
-        vad_levels = [1, 2, 3]
-        audio_16bit = (audio * 32767).astype(np.int16)
-        frame_size = int(sr * frame_duration / 1000)
+    # 2.1: Enhanced Voice Activity Detection using librosa
+    def enhanced_voice_activity_detection(audio, sr, frame_length=2048, hop_length=512):
+        # Compute multiple features for robust VAD
+        # RMS energy
+        rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
         
-        padding = frame_size - (len(audio_16bit) % frame_size)
-        if padding != frame_size:
-            audio_16bit = np.pad(audio_16bit, (0, padding), mode='constant')
+        # Zero crossing rate (speech has moderate ZCR)
+        zcr = librosa.feature.zero_crossing_rate(audio, frame_length=frame_length, hop_length=hop_length)[0]
         
-        vad_votes = []
-        for level in vad_levels:
-            vad = webrtcvad.Vad(level)
-            voice_frames = []
-            
-            for i in range(0, len(audio_16bit), frame_size):
-                frame = audio_16bit[i:i+frame_size].tobytes()
-                try:
-                    is_speech = vad.is_speech(frame, sr)
-                except:
-                    is_speech = False
-                voice_frames.append(is_speech)
-            
-            vad_votes.append(voice_frames)
+        # Spectral centroid (speech has characteristic spectral shape)
+        spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=hop_length)[0]
         
-        # Majority voting
-        final_voice_frames = []
-        for i in range(len(vad_votes[0])):
-            votes = sum(vad_vote[i] for vad_vote in vad_votes)
-            final_voice_frames.append(votes >= 2)
+        # Combine features for voice activity detection
+        # Normalize features
+        rms_norm = (rms - np.mean(rms)) / (np.std(rms) + 1e-8)
+        zcr_norm = (zcr - np.mean(zcr)) / (np.std(zcr) + 1e-8)
+        centroid_norm = (spectral_centroid - np.mean(spectral_centroid)) / (np.std(spectral_centroid) + 1e-8)
         
-        voice_mask = np.repeat(final_voice_frames, frame_size)[:len(audio)]
+        # Simple voice activity detection based on energy and spectral characteristics
+        energy_threshold = np.percentile(rms, 30)  # Bottom 30% is likely silence
+        zcr_min, zcr_max = np.percentile(zcr, [20, 80])  # Speech has moderate ZCR
+        
+        voice_frames = (rms > energy_threshold) & (zcr >= zcr_min) & (zcr <= zcr_max)
+        
+        # Apply median filter for smoothing
+        voice_frames = medfilt(voice_frames.astype(int), kernel_size=5).astype(bool)
+        
+        # Convert frame-level decisions to sample-level mask
+        voice_mask = np.repeat(voice_frames, hop_length)[:len(audio)]
+        
+        # Apply morphological operations for smoothing
+        from scipy.ndimage import binary_dilation, binary_erosion
         voice_mask = binary_dilation(voice_mask, iterations=2)
         voice_mask = binary_erosion(voice_mask, iterations=1)
         
