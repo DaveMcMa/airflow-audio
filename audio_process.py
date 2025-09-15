@@ -49,24 +49,29 @@ def install_audio_packages():
     
     logger.info("Installing required audio packages...")
     
-    # Install webrtcvad-wheels first with specific flags
+    # Install webrtcvad-wheels first with specific flags and longer timeout
+    logger.info("Installing webrtcvad-wheels...")
     webrtc_result = subprocess.run(
         [
             "pip", "install", "--no-cache-dir", 
             "--only-binary=:all:",  # Force binary wheel
             "--prefer-binary",      # Prefer binary over source
+            "--verbose",            # Add verbose output
             "webrtcvad-wheels==2.0.14"
         ],
         capture_output=True,
         text=True,
-        timeout=300
+        timeout=600  # Increase to 10 minutes
     )
     
     if webrtc_result.returncode != 0:
         logger.error(f"WebRTC installation failed: {webrtc_result.stderr}")
+        logger.error(f"WebRTC stdout: {webrtc_result.stdout}")
         raise RuntimeError(f"WebRTC installation failed: {webrtc_result.stderr}")
     
-    # Install other packages
+    logger.info(f"WebRTC installation successful: {webrtc_result.stdout}")
+    
+    # Install other packages one by one to see which one might be causing issues
     packages = [
         "torch==2.0.1", 
         "torchaudio==2.0.2", 
@@ -77,16 +82,22 @@ def install_audio_packages():
         "scipy==1.10.1"
     ]
     
-    result = subprocess.run(
-        ["pip", "install", "--no-cache-dir"] + packages,
-        capture_output=True,
-        text=True,
-        timeout=900
-    )
+    for package in packages:
+        logger.info(f"Installing {package}...")
+        result = subprocess.run(
+            ["pip", "install", "--no-cache-dir", package],
+            capture_output=True,
+            text=True,
+            timeout=900
+        )
+        
+        if result.returncode != 0:
+            logger.error(f"Failed to install {package}: {result.stderr}")
+            raise RuntimeError(f"Failed to install {package}: {result.stderr}")
+        
+        logger.info(f"Successfully installed {package}")
     
-    if result.returncode != 0:
-        logger.error(f"Package installation failed: {result.stderr}")
-        raise RuntimeError(f"Package installation failed: {result.stderr}")
+    logger.info("All audio packages installed successfully")
     
     logger.info("Audio packages installed successfully")
 def validate_audio_file(audio_data, sample_rate, min_duration=1.0, max_duration=3600.0):
