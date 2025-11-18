@@ -68,7 +68,7 @@ def validate_audio_file(audio_data, sample_rate, min_duration=1.0, max_duration=
 # DAG Definition
 # -----------------------------
 with DAG(
-    dag_id='process_audio_all_files_improved',
+    dag_id='masterDAG',
     schedule_interval='0 */12 * * *',
     start_date=days_ago(1),
     tags=['audio', 'processing', 'improved'],
