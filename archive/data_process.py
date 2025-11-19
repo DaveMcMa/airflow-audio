@@ -77,14 +77,14 @@ def get_file_checksum(s3_client, bucket, key):
 # -----------------------------
 # DAG Definition
 # -----------------------------
-with DAG(
-    dag_id='process_audio_all_files_improved',
-    schedule_interval='0 */12 * * *',  # Fixed cron expression
-    start_date=days_ago(1),
-    tags=['audio', 'processing', 'improved'],
-    catchup=False,
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
-) as dag:
+#with DAG(
+#    dag_id='process_audio_all_files_improved',
+#    schedule_interval='0 */12 * * *',  # Fixed cron expression
+#    start_date=days_ago(1),
+#    tags=['audio', 'processing', 'improved'],
+#    catchup=False,
+#    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
+#) as dag:
 
     @task
     def list_raw_files():
