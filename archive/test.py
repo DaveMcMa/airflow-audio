@@ -43,19 +43,19 @@ default_args = {
     'retries': 0,
 }
 
-with DAG(
-    dag_id='test_audio_dag',
-    default_args=default_args,
-    schedule_interval=None,
-    tags=['s3', 'audio', 'test'],
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
-    params={
-        's3_endpoint': "local-s3-service.ezdata-system.svc.cluster.local:30000",
-        's3_endpoint_ssl_enabled': False,
-        's3_bucket_raw': "audio-raw",
-        's3_bucket_processed': "audio-processed",
-    }
-) as dag:
+#with DAG(
+##    dag_id='test_audio_dag',
+#    default_args=default_args,
+#    schedule_interval=None,
+#    tags=['s3', 'audio', 'test'],
+#    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},  # ✅ valid permissions
+#    params={
+#        's3_endpoint': "local-s3-service.ezdata-system.svc.cluster.local:30000",
+#        's3_endpoint_ssl_enabled': False,
+#        's3_bucket_raw': "audio-raw",
+#        's3_bucket_processed': "audio-processed",
+#    }
+#) as dag:
 
     @task
     def list_s3_objects(bucket_name: str):
