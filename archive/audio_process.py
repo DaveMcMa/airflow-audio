@@ -693,14 +693,14 @@ def advanced_audio_processing_step2(audio, sr):
 # -----------------------------
 # DAG Definition
 # -----------------------------
-with DAG(
-    dag_id='full_advanced_audio_processing',
-    schedule_interval='0 */12 * * *',
-    start_date=days_ago(1),
-    tags=['audio', 'processing', 'full-advanced', 'diarization'],
-    catchup=False,
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
-) as dag:
+#with DAG(
+#    dag_id='full_advanced_audio_processing',
+#    schedule_interval='0 */12 * * *',
+#    start_date=days_ago(1),
+#    tags=['audio', 'processing', 'full-advanced', 'diarization'],
+#    catchup=False,
+#    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
+#) as dag:
 
     @task
     def list_raw_files():
