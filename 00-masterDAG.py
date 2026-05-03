@@ -8,13 +8,9 @@ import pendulum
 from airflow import DAG
 from airflow.decorators import task
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# Constants
-# -----------------------------
 INPUT_BUCKET = "audio-raw"
 OUTPUT_BUCKET = "audio-processed"
 S3_ENDPOINT = "http://local-s3-service.ezdata-system.svc.cluster.local:30000"
@@ -32,11 +28,8 @@ REQUIRED_PACKAGES = [
     "numpy==1.24.3",
 ]
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
+
 def get_token():
-    """Fetch JWT token from Kubernetes secret."""
     try:
         with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
             namespace = f.read().strip()
@@ -50,7 +43,6 @@ def get_token():
 
 
 def get_s3_client():
-    """Return a boto3 S3 client configured with JWT auth."""
     try:
         return boto3.client(
             "s3",
@@ -65,21 +57,17 @@ def get_s3_client():
 
 
 def validate_audio(audio_data, sample_rate, min_duration=1.0, max_duration=3600.0):
-    """Validate basic audio properties."""
     duration = len(audio_data) / sample_rate
-
     if not (min_duration <= duration <= max_duration):
         raise ValueError(f"Audio duration {duration:.2f}s out of range [{min_duration}, {max_duration}]")
     if sample_rate < 8000:
         raise ValueError(f"Sample rate too low: {sample_rate}Hz (min 8000Hz)")
     if audio_data.ndim > 1 and audio_data.shape[1] > 2:
         raise ValueError(f"Too many channels: {audio_data.shape[1]} (max 2)")
-
     logger.info(f"Audio validated: {duration:.2f}s at {sample_rate}Hz")
 
 
 def install_packages():
-    """Install required audio processing packages. Raises on failure."""
     logger.info("Installing required packages...")
     result = subprocess.run(
         ["pip", "install", "--no-cache-dir"] + REQUIRED_PACKAGES,
@@ -92,21 +80,16 @@ def install_packages():
     logger.info("Packages installed successfully.")
 
 
-# -----------------------------
-# DAG Definition
-# -----------------------------
 with DAG(
     dag_id="masterDAG",
-    schedule_interval="0 */12 * * *",
+    schedule="0 */12 * * *",
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     tags=["audio", "processing"],
     catchup=False,
-    access_control={"Admin": {"can_read", "can_edit", "can_delete"}},
 ) as dag:
 
     @task
     def list_raw_files():
-        """List all valid WAV files in the raw bucket."""
         s3 = get_s3_client()
         resp = s3.list_objects_v2(Bucket=INPUT_BUCKET)
 
@@ -135,7 +118,6 @@ with DAG(
 
     @task
     def process_all_files(file_list):
-        """Install packages once, then process all WAV files sequentially."""
         if not file_list:
             logger.warning("No files to process.")
             return []
@@ -158,14 +140,12 @@ with DAG(
             file_key = file_info["key"]
             output_key = file_key.replace(".wav", "_processed.wav")
 
-            # Skip if already processed
             try:
                 existing = s3.head_object(Bucket=OUTPUT_BUCKET, Key=output_key)
                 if existing["ContentLength"] > MIN_PROCESSED_SIZE_BYTES:
                     logger.info(f"Already processed, skipping: {file_key}")
                     results.append({"status": "skipped", "file_key": file_key, "output_key": output_key})
                     continue
-                logger.warning(f"Existing output too small, reprocessing: {file_key}")
             except s3.exceptions.ClientError as e:
                 if e.response["Error"]["Code"] != "404":
                     logger.error(f"S3 head error for {file_key}: {e}")
@@ -173,32 +153,22 @@ with DAG(
                     continue
 
             try:
-                # Download
                 logger.info(f"Downloading: {file_key}")
                 obj = s3.get_object(Bucket=INPUT_BUCKET, Key=file_key)
                 audio_bytes = BytesIO(obj["Body"].read())
                 original_size = len(audio_bytes.getvalue())
 
-                # Load & validate
                 audio, sr = librosa.load(audio_bytes, sr=None)
                 validate_audio(audio, sr)
 
-                # Noise reduction
-                logger.info(f"  Denoising: {file_key}")
                 audio = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
                 if not np.isfinite(audio).all():
                     raise ValueError("Noise reduction produced NaN/Inf values.")
 
-                # Normalize
                 audio = librosa.util.normalize(audio)
-
-                # Preemphasis
                 audio = librosa.effects.preemphasis(audio, coef=0.95)
-
-                # Final validation
                 validate_audio(audio, sr)
 
-                # Encode & upload
                 buf = BytesIO()
                 sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
                 buf.seek(0)
@@ -221,7 +191,7 @@ with DAG(
                     },
                 )
 
-                logger.info(f"  ✓ Done: {output_key} ({processed_size} bytes)")
+                logger.info(f"✓ Done: {output_key} ({processed_size} bytes)")
                 results.append({
                     "status": "success",
                     "file_key": file_key,
@@ -232,7 +202,7 @@ with DAG(
                 })
 
             except Exception as e:
-                logger.error(f"  ✗ Failed: {file_key} — {e}")
+                logger.error(f"✗ Failed: {file_key} — {e}")
                 try:
                     s3.delete_object(Bucket=OUTPUT_BUCKET, Key=output_key)
                 except Exception:
@@ -243,7 +213,6 @@ with DAG(
 
     @task
     def summarize_results(results):
-        """Log and return a processing summary."""
         total = len(results)
         successful = sum(1 for r in results if r.get("status") == "success")
         skipped = sum(1 for r in results if r.get("status") == "skipped")
@@ -267,7 +236,6 @@ with DAG(
 
         return {"total": total, "successful": successful, "skipped": skipped, "failed": failed}
 
-    # DAG Flow
     raw_files = list_raw_files()
     process_results = process_all_files(raw_files)
     summarize_results(process_results)
