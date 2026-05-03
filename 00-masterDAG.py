@@ -86,6 +86,7 @@ with DAG(
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     tags=["audio", "processing"],
     catchup=False,
+    access_control={"Admin": {"DAGs": {"can_read", "can_edit", "can_delete"}}},
 ) as dag:
 
     @task
