@@ -1,16 +1,36 @@
 import base64
 import boto3
 import logging
-import hashlib
+import subprocess
 from io import BytesIO
+
+import pendulum
 from airflow import DAG
 from airflow.decorators import task
-from airflow.utils.dates import days_ago
-import subprocess
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# -----------------------------
+# Constants
+# -----------------------------
+INPUT_BUCKET = "audio-raw"
+OUTPUT_BUCKET = "audio-processed"
+S3_ENDPOINT = "http://local-s3-service.ezdata-system.svc.cluster.local:30000"
+MIN_FILE_SIZE_MB = 0.1
+MAX_FILE_SIZE_MB = 500
+MIN_PROCESSED_SIZE_BYTES = 1000
+PROCESSING_VERSION = "2.0"
+
+REQUIRED_PACKAGES = [
+    "torch==2.0.1",
+    "torchaudio==2.0.2",
+    "librosa==0.10.1",
+    "noisereduce==3.0.0",
+    "soundfile==0.12.1",
+    "numpy==1.24.3",
+]
 
 # -----------------------------
 # Helper Functions
@@ -19,314 +39,235 @@ def get_token():
     """Fetch JWT token from Kubernetes secret."""
     try:
         with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
-            namespace = f.read()
+            namespace = f.read().strip()
         from airflow.providers.cncf.kubernetes.hooks.kubernetes import KubernetesHook
         k8s_hook = KubernetesHook()
         secret = k8s_hook.core_v1_client.read_namespaced_secret("access-token", namespace)
-        token_encoded = secret.data["AUTH_TOKEN"]
-        return base64.b64decode(token_encoded).decode("utf-8")
+        return base64.b64decode(secret.data["AUTH_TOKEN"]).decode("utf-8")
     except Exception as e:
-        logger.error(f"Failed to get token: {str(e)}")
+        logger.error(f"Failed to get token: {e}")
         raise
 
+
 def get_s3_client():
-    """Return boto3 S3 client configured with JWT auth."""
-    endpoint_url = "http://local-s3-service.ezdata-system.svc.cluster.local:30000"
+    """Return a boto3 S3 client configured with JWT auth."""
     try:
-        jwt_token = get_token()
         return boto3.client(
             "s3",
-            aws_access_key_id=jwt_token,
+            aws_access_key_id=get_token(),
             aws_secret_access_key="s3",
-            endpoint_url=endpoint_url,
+            endpoint_url=S3_ENDPOINT,
             use_ssl=False,
         )
     except Exception as e:
-        logger.error(f"Failed to create S3 client: {str(e)}")
+        logger.error(f"Failed to create S3 client: {e}")
         raise
 
-def validate_audio_file(audio_data, sample_rate, min_duration=1.0, max_duration=3600.0):
-    """Validate audio file properties"""
+
+def validate_audio(audio_data, sample_rate, min_duration=1.0, max_duration=3600.0):
+    """Validate basic audio properties."""
     duration = len(audio_data) / sample_rate
-    
-    if duration < min_duration:
-        raise ValueError(f"Audio too short: {duration:.2f}s (minimum: {min_duration}s)")
-    
-    if duration > max_duration:
-        raise ValueError(f"Audio too long: {duration:.2f}s (maximum: {max_duration}s)")
-    
+
+    if not (min_duration <= duration <= max_duration):
+        raise ValueError(f"Audio duration {duration:.2f}s out of range [{min_duration}, {max_duration}]")
     if sample_rate < 8000:
-        raise ValueError(f"Sample rate too low: {sample_rate}Hz (minimum: 8000Hz)")
-    
-    if len(audio_data.shape) > 1 and audio_data.shape[1] > 2:
-        raise ValueError(f"Too many channels: {audio_data.shape[1]} (maximum: 2)")
-    
-    logger.info(f"Audio validation passed: {duration:.2f}s at {sample_rate}Hz")
-    return True
+        raise ValueError(f"Sample rate too low: {sample_rate}Hz (min 8000Hz)")
+    if audio_data.ndim > 1 and audio_data.shape[1] > 2:
+        raise ValueError(f"Too many channels: {audio_data.shape[1]} (max 2)")
+
+    logger.info(f"Audio validated: {duration:.2f}s at {sample_rate}Hz")
+
+
+def install_packages():
+    """Install required audio processing packages. Raises on failure."""
+    logger.info("Installing required packages...")
+    result = subprocess.run(
+        ["pip", "install", "--no-cache-dir"] + REQUIRED_PACKAGES,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Package installation failed:\n{result.stderr}")
+    logger.info("Packages installed successfully.")
+
 
 # -----------------------------
 # DAG Definition
 # -----------------------------
 with DAG(
-    dag_id='masterDAG',
-    schedule_interval='0 */12 * * *',
-    start_date=days_ago(1),
-    tags=['audio', 'processing', 'improved'],
+    dag_id="masterDAG",
+    schedule_interval="0 */12 * * *",
+    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
+    tags=["audio", "processing"],
     catchup=False,
-    access_control={'Admin': {'can_read', 'can_edit', 'can_delete'}},
+    access_control={"Admin": {"can_read", "can_edit", "can_delete"}},
 ) as dag:
 
     @task
     def list_raw_files():
-        """List all WAV files in the raw bucket with validation"""
-        try:
-            s3 = get_s3_client()
-            bucket = "audio-raw"
-            
-            logger.info(f"Listing files in bucket: {bucket}")
-            resp = s3.list_objects_v2(Bucket=bucket)
-            
-            if 'Contents' not in resp:
-                logger.warning("No files found in raw bucket")
-                return []
-            
-            files = []
-            for obj in resp["Contents"]:
-                key = obj["Key"]
-                if key.lower().endswith(".wav"):
-                    # Check file size (basic validation)
-                    size_mb = obj["Size"] / (1024 * 1024)
-                    if 0.1 <= size_mb <= 500:  # Between 100KB and 500MB
-                        files.append({
-                            'key': key,
-                            'size_mb': size_mb,
-                            'last_modified': obj['LastModified'].isoformat()
-                        })
-                        logger.info(f"Found valid WAV file: {key} ({size_mb:.2f}MB)")
-                    else:
-                        logger.warning(f"Skipping {key}: invalid size {size_mb:.2f}MB")
-            
-            logger.info(f"Found {len(files)} valid WAV files")
-            return files
-            
-        except Exception as e:
-            logger.error(f"Failed to list raw files: {str(e)}")
-            raise
+        """List all valid WAV files in the raw bucket."""
+        s3 = get_s3_client()
+        resp = s3.list_objects_v2(Bucket=INPUT_BUCKET)
+
+        if "Contents" not in resp:
+            logger.warning("No files found in raw bucket.")
+            return []
+
+        files = []
+        for obj in resp["Contents"]:
+            key = obj["Key"]
+            if not key.lower().endswith(".wav"):
+                continue
+            size_mb = obj["Size"] / (1024 * 1024)
+            if MIN_FILE_SIZE_MB <= size_mb <= MAX_FILE_SIZE_MB:
+                files.append({
+                    "key": key,
+                    "size_mb": round(size_mb, 2),
+                    "last_modified": obj["LastModified"].isoformat(),
+                })
+                logger.info(f"Queued: {key} ({size_mb:.2f}MB)")
+            else:
+                logger.warning(f"Skipping {key}: size {size_mb:.2f}MB out of range.")
+
+        logger.info(f"Total files queued: {len(files)}")
+        return files
 
     @task
     def process_all_files(file_list):
-        """Process all WAV files sequentially with packages installed once"""
+        """Install packages once, then process all WAV files sequentially."""
         if not file_list:
-            logger.warning("No files to process")
+            logger.warning("No files to process.")
             return []
-        
-        # Install packages ONCE for all files
+
         try:
-            logger.info("Installing required packages (one time for all files)...")
-            result = subprocess.run(
-                ["pip", "install", "--no-cache-dir",
-                 "torch==2.0.1", "torchaudio==2.0.2", 
-                 "librosa==0.10.1", "noisereduce==3.0.0", 
-                 "soundfile==0.12.1", "numpy==1.24.3"],
-                capture_output=True,
-                text=True,
-                timeout=900  # 15 minutes for PyTorch
-            )
-            
-            if result.returncode != 0:
-                logger.error(f"Package installation failed: {result.stderr}")
-                # Return all files as failed
-                return [{"status": "failed", "error": f"Package installation failed: {result.stderr}", 
-                        "file_key": f.get('key')} for f in file_list]
-            
-            logger.info("Packages installed successfully")
-            
-        except subprocess.TimeoutExpired:
-            logger.error("Package installation timed out after 15 minutes")
-            return [{"status": "failed", "error": "Package installation timeout", 
-                    "file_key": f.get('key')} for f in file_list]
+            install_packages()
         except Exception as e:
-            logger.error(f"Package installation error: {str(e)}")
-            return [{"status": "failed", "error": str(e), 
-                    "file_key": f.get('key')} for f in file_list]
-        
-        # Now import libraries
+            logger.error(str(e))
+            return [{"status": "failed", "error": str(e), "file_key": f.get("key")} for f in file_list]
+
         import librosa
         import noisereduce as nr
-        import soundfile as sf
         import numpy as np
-        
+        import soundfile as sf
+
         s3 = get_s3_client()
-        input_bucket = "audio-raw"
-        output_bucket = "audio-processed"
-        
         results = []
-        
-        # Process each file sequentially
+
         for file_info in file_list:
-            file_key = file_info['key']
+            file_key = file_info["key"]
             output_key = file_key.replace(".wav", "_processed.wav")
-            
+
+            # Skip if already processed
             try:
-                # Check if already processed
-                try:
-                    existing_obj = s3.head_object(Bucket=output_bucket, Key=output_key)
-                    existing_size = existing_obj['ContentLength']
-                    
-                    if existing_size > 1000:  # At least 1KB
-                        logger.info(f"Skipping {file_key}, already processed ({existing_size} bytes)")
-                        results.append({
-                            "status": "skipped", 
-                            "reason": "already_processed",
-                            "file_key": file_key,
-                            "output_key": output_key
-                        })
-                        continue
-                    else:
-                        logger.warning(f"Existing file too small ({existing_size} bytes), reprocessing")
-                        
-                except s3.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] != '404':
-                        logger.error(f"Error checking existing file: {str(e)}")
-                        results.append({
-                            "status": "failed",
-                            "error": f"S3 check failed: {str(e)}",
-                            "file_key": file_key
-                        })
-                        continue
-                    # File doesn't exist, continue processing
-                
-                # Download audio file
-                logger.info(f"Processing {file_key}...")
-                obj = s3.get_object(Bucket=input_bucket, Key=file_key)
-                audio_bytes = BytesIO(obj['Body'].read())
+                existing = s3.head_object(Bucket=OUTPUT_BUCKET, Key=output_key)
+                if existing["ContentLength"] > MIN_PROCESSED_SIZE_BYTES:
+                    logger.info(f"Already processed, skipping: {file_key}")
+                    results.append({"status": "skipped", "file_key": file_key, "output_key": output_key})
+                    continue
+                logger.warning(f"Existing output too small, reprocessing: {file_key}")
+            except s3.exceptions.ClientError as e:
+                if e.response["Error"]["Code"] != "404":
+                    logger.error(f"S3 head error for {file_key}: {e}")
+                    results.append({"status": "failed", "error": str(e), "file_key": file_key})
+                    continue
+
+            try:
+                # Download
+                logger.info(f"Downloading: {file_key}")
+                obj = s3.get_object(Bucket=INPUT_BUCKET, Key=file_key)
+                audio_bytes = BytesIO(obj["Body"].read())
                 original_size = len(audio_bytes.getvalue())
-                logger.info(f"  Downloaded {original_size} bytes")
-                
-                # Load and validate audio
-                logger.info("  Loading audio...")
+
+                # Load & validate
                 audio, sr = librosa.load(audio_bytes, sr=None)
-                validate_audio_file(audio, sr)
-                
-                # Step 1: Noise reduction
-                logger.info("  Applying noise reduction...")
-                audio_denoised = nr.reduce_noise(
-                    y=audio, 
-                    sr=sr, 
-                    stationary=False, 
-                    prop_decrease=0.8
-                )
-                
-                # Validate output
-                if np.any(np.isnan(audio_denoised)) or np.any(np.isinf(audio_denoised)):
-                    raise ValueError("Noise reduction produced invalid values")
-                
-                # Step 2: Normalization
-                logger.info("  Normalizing audio...")
-                audio_norm = librosa.util.normalize(audio_denoised)
-                
-                if np.max(np.abs(audio_norm)) > 1.1:
-                    logger.warning(f"  Normalization warning: max amplitude {np.max(np.abs(audio_norm))}")
-                
-                # Step 3: Preemphasis
-                logger.info("  Applying preemphasis...")
-                audio_final = librosa.effects.preemphasis(audio_norm, coef=0.95)
-                
+                validate_audio(audio, sr)
+
+                # Noise reduction
+                logger.info(f"  Denoising: {file_key}")
+                audio = nr.reduce_noise(y=audio, sr=sr, stationary=False, prop_decrease=0.8)
+                if not np.isfinite(audio).all():
+                    raise ValueError("Noise reduction produced NaN/Inf values.")
+
+                # Normalize
+                audio = librosa.util.normalize(audio)
+
+                # Preemphasis
+                audio = librosa.effects.preemphasis(audio, coef=0.95)
+
                 # Final validation
-                validate_audio_file(audio_final, sr)
-                
-                # Save processed audio
-                logger.info("  Saving processed audio...")
+                validate_audio(audio, sr)
+
+                # Encode & upload
                 buf = BytesIO()
-                sf.write(buf, audio_final, sr, format='WAV', subtype='PCM_16')
+                sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
                 buf.seek(0)
                 processed_data = buf.getvalue()
                 processed_size = len(processed_data)
-                
-                # Validate processed file size
-                if processed_size < 1000:
+
+                if processed_size < MIN_PROCESSED_SIZE_BYTES:
                     raise ValueError(f"Processed file too small: {processed_size} bytes")
-                
-                # Upload with metadata
+
                 s3.put_object(
-                    Bucket=output_bucket, 
-                    Key=output_key, 
+                    Bucket=OUTPUT_BUCKET,
+                    Key=output_key,
                     Body=processed_data,
                     Metadata={
-                        'original_file': file_key,
-                        'original_size': str(original_size),
-                        'processed_size': str(processed_size),
-                        'sample_rate': str(sr),
-                        'processing_version': '2.0'
-                    }
+                        "original_file": file_key,
+                        "original_size": str(original_size),
+                        "processed_size": str(processed_size),
+                        "sample_rate": str(sr),
+                        "processing_version": PROCESSING_VERSION,
+                    },
                 )
-                
-                logger.info(f"  ✓ Successfully processed: {output_key} ({processed_size} bytes)")
-                
+
+                logger.info(f"  ✓ Done: {output_key} ({processed_size} bytes)")
                 results.append({
                     "status": "success",
+                    "file_key": file_key,
+                    "output_key": output_key,
                     "original_size": original_size,
                     "processed_size": processed_size,
                     "sample_rate": sr,
-                    "output_key": output_key,
-                    "file_key": file_key
                 })
-                
+
             except Exception as e:
-                logger.error(f"  ✗ Processing failed for {file_key}: {str(e)}")
-                
-                # Try to clean up any partial uploads
+                logger.error(f"  ✗ Failed: {file_key} — {e}")
                 try:
-                    s3.delete_object(Bucket=output_bucket, Key=output_key)
-                    logger.info(f"  Cleaned up partial upload: {output_key}")
-                except:
+                    s3.delete_object(Bucket=OUTPUT_BUCKET, Key=output_key)
+                except Exception:
                     pass
-                
-                results.append({
-                    "status": "failed",
-                    "error": str(e),
-                    "file_key": file_key
-                })
-        
+                results.append({"status": "failed", "file_key": file_key, "error": str(e)})
+
         return results
 
     @task
-    def summarize_results(process_results):
-        """Summarize processing results"""
-        total_files = len(process_results)
-        successful = sum(1 for r in process_results if r.get('status') == 'success')
-        skipped = sum(1 for r in process_results if r.get('status') == 'skipped')
-        failed = sum(1 for r in process_results if r.get('status') == 'failed')
-        
-        logger.info(f"Processing Summary:")
-        logger.info(f"  Total files: {total_files}")
-        logger.info(f"  Successful: {successful}")
-        logger.info(f"  Skipped: {skipped}")
-        logger.info(f"  Failed: {failed}")
-        
-        # Log failed files with details
-        for result in process_results:
-            if result.get('status') == 'failed':
-                logger.error(f"Failed: {result.get('file_key')} - {result.get('error')}")
-        
-        # Log successful processing stats
-        if successful > 0:
-            total_original = sum(r.get('original_size', 0) for r in process_results if r.get('status') == 'success')
-            total_processed = sum(r.get('processed_size', 0) for r in process_results if r.get('status') == 'success')
-            if total_original > 0:
-                compression_ratio = total_processed / total_original
-                logger.info(f"  Average compression ratio: {compression_ratio:.2f}")
-        
-        return {
-            "total": total_files,
-            "successful": successful,
-            "skipped": skipped,
-            "failed": failed
-        }
+    def summarize_results(results):
+        """Log and return a processing summary."""
+        total = len(results)
+        successful = sum(1 for r in results if r.get("status") == "success")
+        skipped = sum(1 for r in results if r.get("status") == "skipped")
+        failed = sum(1 for r in results if r.get("status") == "failed")
 
-    # -----------------------------
-    # DAG Flow - SIMPLIFIED (no .expand())
-    # -----------------------------
+        logger.info("===== Processing Summary =====")
+        logger.info(f"  Total:      {total}")
+        logger.info(f"  Successful: {successful}")
+        logger.info(f"  Skipped:    {skipped}")
+        logger.info(f"  Failed:     {failed}")
+
+        for r in results:
+            if r.get("status") == "failed":
+                logger.error(f"  FAILED: {r.get('file_key')} — {r.get('error')}")
+
+        if successful:
+            orig_total = sum(r.get("original_size", 0) for r in results if r.get("status") == "success")
+            proc_total = sum(r.get("processed_size", 0) for r in results if r.get("status") == "success")
+            if orig_total:
+                logger.info(f"  Compression ratio: {proc_total / orig_total:.2f}")
+
+        return {"total": total, "successful": successful, "skipped": skipped, "failed": failed}
+
+    # DAG Flow
     raw_files = list_raw_files()
-    process_results = process_all_files(raw_files)  # Single task, no parallel expansion
-    summary = summarize_results(process_results)
+    process_results = process_all_files(raw_files)
+    summarize_results(process_results)
