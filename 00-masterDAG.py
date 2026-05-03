@@ -20,13 +20,14 @@ MIN_PROCESSED_SIZE_BYTES = 1000
 PROCESSING_VERSION = "2.0"
 
 REQUIRED_PACKAGES = [
-    "torch==2.0.1",
-    "torchaudio==2.0.2",
+    "torch==2.2.2",
+    "torchaudio==2.2.2",
     "librosa==0.10.1",
     "noisereduce==3.0.0",
     "soundfile==0.12.1",
-    "numpy==1.24.3",
+    "numpy==1.26.4",        # numpy 1.24.x doesn't support Python 3.12
 ]
+
 
 
 def get_token():
